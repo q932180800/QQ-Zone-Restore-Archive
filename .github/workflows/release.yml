@@ -59,7 +59,7 @@ jobs:
         run: npm ci
 
       - name: Build Windows
-        run: npx tauri build
+        run: npx tauri build --bundles nsis
 
       - name: Show Windows artifacts
         if: always()
@@ -105,7 +105,7 @@ jobs:
         run: npm ci
 
       - name: Build macOS x64
-        run: npx tauri build --target x86_64-apple-darwin
+        run: npx tauri build --target x86_64-apple-darwin --bundles dmg
 
       - name: Show macOS x64 artifacts
         if: always()
@@ -147,7 +147,7 @@ jobs:
         run: npm ci
 
       - name: Build macOS ARM64
-        run: npx tauri build --target aarch64-apple-darwin
+        run: npx tauri build --target aarch64-apple-darwin --bundles dmg
 
       - name: Show macOS ARM64 artifacts
         if: always()
@@ -306,6 +306,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
+            libdbus-1-dev \
+            pkg-config \
             patchelf
 
       - name: Install frontend dependencies
@@ -847,16 +849,24 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            ## Installation
+            ## QQ Zone Restore Archive 1.1.0
 
-            This release includes Windows installers, macOS x64/ARM64 DMGs, Android APK,
-            unsigned iOS IPA, plus Linux AppImage, deb, rpm and NixOS binary packages.
+            这是一个本地优先的 QQ 空间恢复归档工具。本版将当前可见说说、旧历史残留和互动记录进行结构化合并，并提供相册、视频、留言板、旧收藏、联系人互动、年份筛选、全文搜索和离线导出。
 
-            The iOS IPA cannot be installed directly or uploaded to the App Store.
+            ### 下载说明
 
-            iOS users need AltStore, SideStore, Sideloadly,
-            TrollStore, or another signing tool to sign and install it.
+            - Windows：下载 `.exe` 安装程序
+            - macOS Apple 芯片：下载文件名含 `aarch64` 的 `.dmg`
+            - macOS Intel：下载文件名含 `x64` 的 `.dmg`
+            - Linux：按发行版下载 AppImage、`.deb` 或 `.rpm`
+            - Android：下载通用 `.apk`
+            - NixOS：下载包含 Nix closure 的 `.tar.gz`
+            - iOS：提供未签名 `.ipa`，需使用 AltStore、SideStore、Sideloadly、TrollStore 等工具自行签名安装，不能直接安装或提交 App Store
 
-            Unsigned IPA filenames contain `unsigned`.
+            ### 重要说明
+
+            “恢复已删除内容”依赖 QQ 接口仍保留的点赞、评论、回复或其他互动残留。没有互动痕迹、服务端已彻底清除、无权访问或接口不再返回的内容无法恢复，也不能保证结果完整。请仅归档本人账号或已获授权的数据。
+
+            本项目基于 Gaoshu705/QzoneArchive 进行 GPLv3 二次开发，参考项目与完整免责声明见仓库 README 和 THIRD_PARTY_NOTICES。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

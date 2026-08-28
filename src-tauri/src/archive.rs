@@ -11,7 +11,7 @@ use std::{
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tauri::Manager;
 
 use crate::{qlogin::QLoginState, qzone};
@@ -107,6 +107,8 @@ pub struct ArchiveReply {
 pub struct LikeUser {
     uin: Option<String>,
     nickname: Option<String>,
+    historical: bool,
+    liked_at: i64,
 }
 
 #[derive(Serialize)]
@@ -161,6 +163,49 @@ pub struct ArchiveMediaPage {
     items: Vec<ArchiveMediaItem>,
     total: usize,
     years: Vec<i32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryItem {
+    id: i64,
+    module: String,
+    item_key: String,
+    parent_key: String,
+    created_at: i64,
+    title: String,
+    summary: String,
+    author_uin: Option<String>,
+    author_name: Option<String>,
+    cover_url: Option<String>,
+    media_urls: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPage {
+    items: Vec<LibraryItem>,
+    total: u64,
+    remote_total: u64,
+    complete: bool,
+    synced_at: i64,
+    last_error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySyncResult {
+    module: String,
+    fetched: u64,
+    saved: u64,
+    remote_total: u64,
+    complete: bool,
+    message: String,
+}
+
+struct ParsedLibraryPage {
+    items: Vec<Value>,
+    total: usize,
 }
 
 struct ParsedFeed {
@@ -325,6 +370,37 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            resolved_at INTEGER,
            recovered_records INTEGER NOT NULL DEFAULT 0,
            UNIQUE(owner_uin, cursor_offset, base_time)
+         );
+         CREATE TABLE IF NOT EXISTS archive_library_items (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           module TEXT NOT NULL,
+           scope_key TEXT NOT NULL DEFAULT '',
+           item_key TEXT NOT NULL,
+           parent_key TEXT NOT NULL DEFAULT '',
+           created_at INTEGER NOT NULL DEFAULT 0,
+           title TEXT NOT NULL DEFAULT '',
+           summary TEXT NOT NULL DEFAULT '',
+           author_uin TEXT,
+           author_name TEXT,
+           cover_url TEXT,
+           media_json TEXT NOT NULL DEFAULT '[]',
+           raw_json TEXT NOT NULL,
+           archived_at INTEGER NOT NULL,
+           UNIQUE(owner_uin,module,scope_key,item_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_library_module_time
+           ON archive_library_items(owner_uin,module,scope_key,created_at DESC);
+         CREATE TABLE IF NOT EXISTS archive_library_state (
+           owner_uin TEXT NOT NULL,
+           module TEXT NOT NULL,
+           scope_key TEXT NOT NULL DEFAULT '',
+           remote_total INTEGER NOT NULL DEFAULT 0,
+           fetched INTEGER NOT NULL DEFAULT 0,
+           complete INTEGER NOT NULL DEFAULT 0,
+           last_error TEXT,
+           synced_at INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY(owner_uin,module,scope_key)
          );",
         )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
@@ -355,7 +431,255 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     migrate_dynamic_categories(&mut connection)?;
     migrate_history_v1_records(&mut connection)?;
     migrate_qzone_mood_aliases(&mut connection)?;
+    migrate_history_mood_timestamps(&mut connection)?;
+    migrate_history_guestbook_records(&mut connection)?;
+    migrate_library_guestbook_timestamps(&mut connection)?;
     Ok(connection)
+}
+
+fn migrate_library_guestbook_timestamps(connection: &mut Connection) -> Result<(), String> {
+    let applied = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_migrations WHERE name='library-guestbook-timestamps-v1')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查留言板时间修复状态失败：{error}"))?;
+    if applied {
+        return Ok(());
+    }
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id,raw_json FROM archive_library_items
+                 WHERE module='guestbook' AND created_at<=0",
+            )
+            .map_err(|error| format!("读取待修复留言时间失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("查询待修复留言时间失败：{error}"))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        rows
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始修复留言时间失败：{error}"))?;
+    for (id, raw_json) in candidates {
+        let Some(raw) = serde_json::from_str::<Value>(&raw_json).ok() else {
+            continue;
+        };
+        let created_at = library_created_at(&raw);
+        if created_at > 0 {
+            transaction
+                .execute(
+                    "UPDATE archive_library_items SET created_at=?1 WHERE id=?2",
+                    params![created_at, id],
+                )
+                .map_err(|error| format!("修复留言时间失败：{error}"))?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO archive_migrations(name,applied_at) VALUES ('library-guestbook-timestamps-v1',?1)",
+            params![now()],
+        )
+        .map_err(|error| format!("记录留言时间修复状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交留言时间修复失败：{error}"))
+}
+
+fn migrate_history_mood_timestamps(connection: &mut Connection) -> Result<(), String> {
+    let applied = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_migrations WHERE name='history-mood-timestamps-v1')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查历史说说时间修复状态失败：{error}"))?;
+    if applied {
+        return Ok(());
+    }
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT d.owner_uin,d.cell_id,d.published_at,MIN(f.event_time)
+                 FROM archive_dynamics d
+                 JOIN archive_feeds f ON f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id
+                 WHERE f.feed_key LIKE 'history-v2-event:%'
+                 GROUP BY d.owner_uin,d.cell_id,d.published_at",
+            )
+            .map_err(|error| format!("读取待修复历史说说时间失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| format!("查询待修复历史说说时间失败：{error}"))?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        rows
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始修复历史说说时间失败：{error}"))?;
+    for (owner_uin, cell_id, current_time, event_time) in candidates {
+        if let Some(published_at) =
+            qzone::mood_cell_id_published_at(&cell_id, &owner_uin, event_time)
+        {
+            if published_at == current_time {
+                continue;
+            }
+            transaction
+                .execute(
+                    "UPDATE archive_dynamics SET published_at=?1 WHERE owner_uin=?2 AND cell_id=?3",
+                    params![published_at, owner_uin, cell_id],
+                )
+                .map_err(|error| format!("修复历史说说发布时间失败：{error}"))?;
+        } else if cell_id.starts_with("history-v2:") && current_time != 0 {
+            // A hash-only legacy card has no surviving authoritative publish
+            // timestamp. Its card time is the later interaction time, so
+            // presenting that as the publish time is less accurate than
+            // explicitly marking the publish time as unknown.
+            transaction
+                .execute(
+                    "UPDATE archive_dynamics SET published_at=0 WHERE owner_uin=?1 AND cell_id=?2",
+                    params![owner_uin, cell_id],
+                )
+                .map_err(|error| format!("清理无法验证的历史说说时间失败：{error}"))?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO archive_migrations(name,applied_at) VALUES ('history-mood-timestamps-v1',?1)",
+            params![now()],
+        )
+        .map_err(|error| format!("记录历史说说时间修复状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交历史说说时间修复失败：{error}"))
+}
+
+fn strip_history_guestbook_prefix(content: &str) -> String {
+    content
+        .trim()
+        .strip_prefix("留言")
+        .unwrap_or(content.trim())
+        .trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ':' | '：' | '，' | ',' | '。' | '·' | '-')
+        })
+        .trim()
+        .to_owned()
+}
+
+fn migrate_history_guestbook_records(connection: &mut Connection) -> Result<(), String> {
+    let applied = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_migrations WHERE name='history-guestbook-v1')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("检查历史留言修复状态失败：{error}"))?;
+    if applied {
+        return Ok(());
+    }
+    let candidates = {
+        let mut statement = connection
+            .prepare(
+                "SELECT owner_uin,feed_key,cell_id,event_time,actor_uin,actor_name,content,raw_json
+                 FROM archive_feeds
+                 WHERE event_type=334 AND feed_key LIKE 'history-v2-event:%'",
+            )
+            .map_err(|error| format!("读取待修复历史留言失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|error| format!("查询待修复历史留言失败：{error}"))?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始修复历史留言失败：{error}"))?;
+    for (owner_uin, feed_key, old_cell_id, event_time, actor_uin, actor_name, content, raw_json) in
+        candidates
+    {
+        let stable_id = feed_key
+            .strip_prefix("history-v2-event:")
+            .unwrap_or(&feed_key);
+        let new_cell_id = format!("history-guestbook:{stable_id}");
+        let content = strip_history_guestbook_prefix(content.as_deref().unwrap_or_default());
+        let raw_original_json = serde_json::from_str::<Value>(&raw_json)
+            .ok()
+            .and_then(|value| value.get("original").cloned())
+            .unwrap_or_else(|| json!({}))
+            .to_string();
+        transaction
+            .execute(
+                "INSERT INTO archive_dynamics
+                 (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,raw_original_json,archived_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,'guestbook',NULL,NULL,?7,?8)
+                 ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
+                  published_at=excluded.published_at,content=excluded.content,
+                  author_uin=excluded.author_uin,author_name=excluded.author_name,
+                  category='guestbook',raw_original_json=excluded.raw_original_json,
+                  archived_at=excluded.archived_at",
+                params![
+                    owner_uin,
+                    new_cell_id,
+                    event_time,
+                    content,
+                    actor_uin,
+                    actor_name,
+                    raw_original_json,
+                    now()
+                ],
+            )
+            .map_err(|error| format!("重建历史留言失败：{error}"))?;
+        transaction
+            .execute(
+                "UPDATE archive_feeds SET cell_id=?1,content=?2,event_summary=?2 WHERE owner_uin=?3 AND feed_key=?4",
+                params![new_cell_id, content, owner_uin, feed_key],
+            )
+            .map_err(|error| format!("关联历史留言失败：{error}"))?;
+        if let Some(old_cell_id) = old_cell_id.filter(|value| value.starts_with("history-v2:")) {
+            transaction
+                .execute(
+                    "DELETE FROM archive_dynamics
+                     WHERE owner_uin=?1 AND cell_id=?2
+                       AND NOT EXISTS(SELECT 1 FROM archive_feeds f
+                         WHERE f.owner_uin=?1 AND f.cell_id=?2)",
+                    params![owner_uin, old_cell_id],
+                )
+                .map_err(|error| format!("清理错误归类的历史留言失败：{error}"))?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO archive_migrations(name,applied_at) VALUES ('history-guestbook-v1',?1)",
+            params![now()],
+        )
+        .map_err(|error| format!("记录历史留言修复状态失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交历史留言修复失败：{error}"))
 }
 
 fn canonical_qzone_cell_id(cell_id: &str) -> Option<String> {
@@ -1264,23 +1588,39 @@ fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
         .into_iter()
         .flatten()
         .filter_map(|pic| {
-            let photo_urls = pic.get("photourl")?;
-            let values = match photo_urls {
-                Value::Array(items) => items.iter().collect::<Vec<_>>(),
-                Value::Object(items) => items.values().collect::<Vec<_>>(),
-                _ => vec![],
+            let values = match pic.get("photourl") {
+                Some(Value::Array(items)) => items.iter().collect::<Vec<_>>(),
+                Some(Value::Object(items)) => items.values().collect::<Vec<_>>(),
+                _ => Vec::new(),
             };
-            let candidates = values
+            let mut candidates = values
                 .into_iter()
                 .filter_map(|item| {
-                    let url = item.get("url")?.as_str()?.trim();
+                    let url = item
+                        .as_str()
+                        .or_else(|| item.get("url").and_then(Value::as_str))?
+                        .trim();
                     if url.is_empty() {
                         return None;
                     }
                     Some(url.to_owned())
                 })
                 .collect::<Vec<_>>();
-            let mut candidates = candidates;
+            for name in [
+                "rawUrl",
+                "origin_url",
+                "url3",
+                "url2",
+                "url1",
+                "url",
+                "smallurl",
+            ] {
+                if let Some(url) = pic.get(name).and_then(Value::as_str).map(str::trim) {
+                    if !url.is_empty() {
+                        candidates.push(url.to_owned());
+                    }
+                }
+            }
             if let Some(url) = pic
                 .pointer("/busi_param/-1")
                 .and_then(Value::as_str)
@@ -1299,11 +1639,21 @@ fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
                         url
                     }
                 })
+                .filter(|url| is_content_media_url(url))
                 .filter(|url| seen.insert(url.clone()))
                 .collect::<Vec<_>>();
             (!urls.is_empty()).then_some(urls)
         })
         .collect()
+}
+
+fn is_content_media_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (url.starts_with("http://") || url.starts_with("https://"))
+        && !lower.contains("qlogo")
+        && !lower.contains("headimg")
+        && !lower.contains("qzonestyle")
+        && !lower.contains("custompraise")
 }
 
 fn picture_urls(json: Option<String>) -> Vec<String> {
@@ -1492,20 +1842,53 @@ fn video_urls(json: Option<String>) -> Vec<String> {
     let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
         return vec![];
     };
-    let mut urls = Vec::new();
-    if let Some(url) = value.get("videourl").and_then(Value::as_str) {
-        urls.push(url.to_owned());
+    fn push(urls: &mut Vec<String>, value: Option<&str>) {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let url = if value.starts_with("//") {
+            format!("https:{value}")
+        } else {
+            value.to_owned()
+        };
+        if is_content_media_url(&url) && !urls.iter().any(|saved| saved == &url) {
+            urls.push(url);
+        }
     }
-    if let Some(items) = value.get("videourls").and_then(Value::as_object) {
-        for url in items
-            .values()
-            .filter_map(|item| item.get("url").and_then(Value::as_str))
-        {
-            if !urls.iter().any(|saved| saved == url) {
-                urls.push(url.to_owned());
+    fn collect_named(value: &Value, urls: &mut Vec<String>) {
+        if let Value::Object(object) = value {
+            for name in [
+                "videourl",
+                "url3",
+                "url2",
+                "actionurl",
+                "playurl",
+                "video_url",
+                "url",
+                "download_url",
+            ] {
+                push(urls, object.get(name).and_then(Value::as_str));
+            }
+            if let Some(collection) = object.get("videourls").or_else(|| object.get("urls")) {
+                match collection {
+                    Value::Array(items) => {
+                        for item in items {
+                            collect_named(item, urls);
+                        }
+                    }
+                    Value::Object(items) => {
+                        for item in items.values() {
+                            collect_named(item, urls);
+                        }
+                    }
+                    Value::String(url) => push(urls, Some(url)),
+                    _ => {}
+                }
             }
         }
     }
+    let mut urls = Vec::new();
+    collect_named(&value, &mut urls);
     urls
 }
 
@@ -1521,6 +1904,10 @@ fn video_cover_url(json: Option<String>) -> Option<String> {
                 .values()
                 .find_map(|item| item.get("url")?.as_str())
         })
+        .or_else(|| value.get("coverurl").and_then(Value::as_str))
+        .or_else(|| value.get("cover_url").and_then(Value::as_str))
+        .or_else(|| value.get("cover").and_then(Value::as_str))
+        .filter(|url| is_content_media_url(url))
         .map(str::to_owned)
 }
 
@@ -1903,103 +2290,100 @@ async fn sync_history_messages(
     owner_name: Option<&str>,
     interval_ms: u64,
 ) -> Result<HistorySyncSummary, String> {
-    // GetQzonehistory first locates the historical-list boundary. Do the same
-    // with 30-item windows (the largest size verified against the live API),
-    // then read every window up to that boundary. Binary discovery reaches far
-    // deeper than a fixed empty-tail scan while spending far fewer requests.
+    // QQ's legacy notification list can contain holes: an empty offset does not
+    // prove that every later offset is empty. Read it sequentially and only stop
+    // after a long verified empty tail. This costs more requests than binary
+    // search, but prevents a single sparse page from hiding older recoverable
+    // records. Normally this uses 30-position windows; endpoints that reject a
+    // large window are retried with the upstream project's 10-position size.
+    // In both cases 6,000 positions past the last hit must be verified empty.
     const PAGE_SIZE: u32 = 30;
+    const FALLBACK_PAGE_SIZE: u32 = 10;
     const MAX_HISTORY_OFFSET: u32 = 10_000_000;
+    const EMPTY_TAIL_POSITIONS: u32 = 6_000;
     let mut summary = HistorySyncSummary::default();
     set_progress(archive, |progress| {
-        progress.message = "正在按 GetQzonehistory 的方式定位历史数据边界…".into();
+        progress.message = "正在顺序读取历史消息，并验证最后 6,000 个位置是否为空…".into();
     });
 
-    let mut lower_page = 0_u32;
-    let mut upper_page = MAX_HISTORY_OFFSET / PAGE_SIZE;
-    let mut last_nonempty_page: Option<u32> = None;
-    while lower_page <= upper_page {
+    let mut offset = 0_u32;
+    let mut consecutive_empty_positions = 0_u32;
+    let mut last_nonempty_offset: Option<u32> = None;
+    while offset <= MAX_HISTORY_OFFSET && consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
         if archive.cancel.load(Ordering::Relaxed) {
             return Ok(summary);
         }
         if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
             return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
         }
-        let page_index = lower_page + (upper_page - lower_page) / 2;
-        let offset = page_index.saturating_mul(PAGE_SIZE);
-        let page = qzone::fetch_history_messages(login, offset, PAGE_SIZE, owner_name).await?;
+        let (page, requested_count) = match qzone::fetch_history_messages(
+            login, offset, PAGE_SIZE, owner_name,
+        )
+        .await
+        {
+            Ok(page) => (page, PAGE_SIZE),
+            Err(primary_error) => {
+                set_progress(archive, |progress| {
+                    progress.message = format!(
+                        "历史 offset {offset} 的 30 条窗口读取失败，正在按 10 条小窗口兼容重试…"
+                    );
+                });
+                match qzone::fetch_history_messages(login, offset, FALLBACK_PAGE_SIZE, owner_name)
+                    .await
+                {
+                    Ok(page) => (page, FALLBACK_PAGE_SIZE),
+                    Err(fallback_error) => {
+                        return Err(format!(
+                                "历史 offset {offset} 的大、小窗口均读取失败：{primary_error}；{fallback_error}"
+                            ));
+                    }
+                }
+            }
+        };
         summary.pages = summary.pages.saturating_add(1);
         summary.deepest_probe_offset = summary.deepest_probe_offset.max(offset);
         set_progress(archive, |progress| {
             progress.pages = progress.pages.saturating_add(1);
-            progress.message =
-                format!("正在定位历史边界：已探测 offset {offset}（上限 {MAX_HISTORY_OFFSET}）…");
         });
         if page.record_count > 0 {
-            last_nonempty_page = Some(page_index);
-            lower_page = page_index.saturating_add(1);
-        } else if page_index == 0 {
-            break;
+            last_nonempty_offset = Some(offset);
+            consecutive_empty_positions = 0;
+            let saved = save_retried_page(app, owner_uin, &page.feeds)?;
+            summary.records = summary.records.saturating_add(page.record_count as u64);
+            summary.saved = summary.saved.saturating_add(saved);
+            set_progress(archive, |progress| {
+                progress.fetched = progress.fetched.saturating_add(page.record_count as u64);
+                progress.saved = progress.saved.saturating_add(saved);
+                progress.message = format!(
+                    "已读取 {} 条历史消息残留，命中 offset {offset}；继续验证更早记录…",
+                    summary.records
+                );
+            });
         } else {
-            upper_page = page_index - 1;
+            consecutive_empty_positions =
+                consecutive_empty_positions.saturating_add(requested_count);
+            set_progress(archive, |progress| {
+                progress.message = format!(
+                    "历史 offset {offset} 暂无内容；已连续验证 {}/{} 个位置…",
+                    consecutive_empty_positions, EMPTY_TAIL_POSITIONS
+                );
+            });
         }
-        tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
-            interval_ms,
-        )))
-        .await;
+        offset = offset.saturating_add(requested_count);
+        if consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
+            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+                interval_ms,
+            )))
+            .await;
+        }
     }
-
-    let last_page = last_nonempty_page.unwrap_or(0);
-    summary.estimated_end_offset = last_page.saturating_mul(PAGE_SIZE);
+    summary.estimated_end_offset = last_nonempty_offset.unwrap_or(0);
     set_progress(archive, |progress| {
         progress.message = format!(
-            "历史边界定位完成（约 offset {}），正在逐页回收全部记录…",
-            summary.estimated_end_offset
+            "历史探测完成：最后命中约 offset {}，其后已连续验证 {} 个位置无记录…",
+            summary.estimated_end_offset, consecutive_empty_positions
         );
     });
-
-    for page_index in 0..=last_page {
-        if archive.cancel.load(Ordering::Relaxed) {
-            return Ok(summary);
-        }
-        if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
-            return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
-        }
-        let offset = page_index.saturating_mul(PAGE_SIZE);
-        let page = qzone::fetch_history_messages(login, offset, PAGE_SIZE, owner_name).await?;
-        summary.pages = summary.pages.saturating_add(1);
-        summary.deepest_probe_offset = summary.deepest_probe_offset.max(offset);
-        set_progress(archive, |progress| {
-            progress.pages = progress.pages.saturating_add(1)
-        });
-        if page.record_count == 0 {
-            set_progress(archive, |progress| {
-                progress.message =
-                    format!("历史 offset {offset} 暂无内容，继续读取已定位范围内的后续窗口…");
-            });
-            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
-                interval_ms,
-            )))
-            .await;
-            continue;
-        }
-        let saved = save_retried_page(app, owner_uin, &page.feeds)?;
-        summary.records = summary.records.saturating_add(page.record_count as u64);
-        summary.saved = summary.saved.saturating_add(saved);
-        set_progress(archive, |progress| {
-            progress.fetched = progress.fetched.saturating_add(page.record_count as u64);
-            progress.saved = progress.saved.saturating_add(saved);
-            progress.message = format!(
-                "已读取 {} 条历史消息残留，当前 offset {offset} / {}…",
-                summary.records, summary.estimated_end_offset
-            );
-        });
-        if page_index < last_page {
-            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
-                interval_ms,
-            )))
-            .await;
-        }
-    }
     Ok(summary)
 }
 
@@ -2318,7 +2702,7 @@ pub async fn start_feed_archive(
                 )
             } else if let Some(error) = visible_sync_error.as_deref() {
                 format!(
-                    "已读取 {} 条历史消息残留（边界约 offset {}，最深探测 {}）并完成互动补充；但可见说说接口暂时不可用（{error}），稍后重试可补齐仍存在的正文和评论回复",
+                    "已读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）并完成互动补充；但可见说说接口暂时不可用（{error}），稍后重试可补齐仍存在的正文和评论回复",
                     history_summary.records,
                     history_summary.estimated_end_offset,
                     history_summary.deepest_probe_offset
@@ -2330,7 +2714,7 @@ pub async fn start_feed_archive(
                 )
             } else if p.skipped > 0 {
                 format!(
-                    "归档完成：已同步 {} / {} 条本人可见说说、{} 条历史消息残留（边界约 offset {}，最深探测 {}），共保存 {} 条接口记录；另有 {} 个异常位置可单独重试",
+                    "归档完成：已同步 {} / {} 条本人可见说说、{} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}），共保存 {} 条接口记录；另有 {} 个异常位置可单独重试",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
@@ -2341,7 +2725,7 @@ pub async fn start_feed_archive(
                 )
             } else {
                 format!(
-                    "归档完成：已同步 {} / {} 条本人可见说说及评论回复，并合并 {} 条历史消息残留（边界约 offset {}，最深探测 {}），共保存 {} 条接口记录",
+                    "归档完成：已同步 {} / {} 条本人可见说说及评论回复，并合并 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}），共保存 {} 条接口记录",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
@@ -2359,7 +2743,7 @@ pub async fn start_feed_archive(
                 );
                 p.status = "completed";
                 p.message = format!(
-                    "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条历史消息残留（边界约 offset {}，最深探测 {}）；互动通知接口暂时不可用（{}），点赞等互动尚未补齐，请稍后继续归档",
+                    "已保存 {} / {} 条本人可见说说及评论回复，并读取 {} 条历史消息残留（最后命中约 offset {}，空尾最深验证至 {}）；互动通知接口暂时不可用（{}），点赞等互动尚未补齐，请稍后继续归档",
                     visible_summary.moments,
                     visible_summary.total,
                     history_summary.records,
@@ -2562,26 +2946,46 @@ pub async fn list_archived_feeds(
     category: String,
     year: Option<i32>,
     descending: Option<bool>,
+    query: Option<String>,
 ) -> Result<Vec<ArchiveItem>, String> {
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
     let order = if descending.unwrap_or(true) { "DESC" } else { "ASC" };
+    let query = query
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     let sql = format!(
             "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
               (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
               (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-             FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2
+             FROM archive_dynamics d WHERE d.owner_uin=?1
+               AND CASE WHEN ?2='guestbook' THEN
+                 (d.category='guestbook' OR EXISTS(SELECT 1 FROM archive_feeds gf
+                   WHERE gf.owner_uin=d.owner_uin AND gf.cell_id=d.cell_id AND gf.event_type=334))
+               ELSE
+                 (d.category=?2 AND NOT EXISTS(SELECT 1 FROM archive_feeds gf
+                   WHERE gf.owner_uin=d.owner_uin AND gf.cell_id=d.cell_id AND gf.event_type=334))
+               END
                AND (?3 IS NULL OR CAST(strftime('%Y',d.published_at,'unixepoch','localtime') AS INTEGER)=?3)
-             ORDER BY d.published_at {order},d.id {order} LIMIT ?4 OFFSET ?5"
+               AND (?4 IS NULL
+                 OR instr(lower(COALESCE(d.content,'')),lower(?4))>0
+                 OR instr(lower(COALESCE(d.author_name,'')),lower(?4))>0
+                 OR instr(COALESCE(d.author_uin,''),?4)>0
+                 OR EXISTS(SELECT 1 FROM archive_feeds sf
+                   WHERE sf.owner_uin=d.owner_uin AND sf.cell_id=d.cell_id
+                     AND (instr(lower(COALESCE(sf.event_summary,'')),lower(?4))>0
+                       OR instr(lower(COALESCE(sf.actor_name,'')),lower(?4))>0
+                       OR instr(COALESCE(sf.actor_uin,''),?4)>0)))
+             ORDER BY d.published_at {order},d.id {order} LIMIT ?5 OFFSET ?6"
         );
     let mut statement = connection
         .prepare(&sql)
         .map_err(|error| format!("读取归档失败：{error}"))?;
     let rows = statement
         .query_map(
-            params![owner_uin, category, year, limit.clamp(1, 200), offset],
+            params![owner_uin, category, year, query, limit.clamp(1, 200), offset],
             |row| {
                 let video_json = row.get::<_, Option<String>>(8)?;
                 let video_urls = video_urls(video_json.clone());
@@ -2644,8 +3048,11 @@ fn hydrate_archive_item_interactions(
     drop(comment_statement);
     let mut like_statement = connection
         .prepare(
-            "SELECT actor_uin,actor_name FROM archive_feeds
-             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+            "SELECT actor_uin,actor_name,
+                    (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%'),event_time
+             FROM archive_feeds
+             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217
+             ORDER BY (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%') ASC,event_time ASC",
         )
         .map_err(|error| format!("准备点赞查询失败：{error}"))?;
     for item in items.iter_mut() {
@@ -2654,6 +3061,8 @@ fn hydrate_archive_item_interactions(
                 Ok(LikeUser {
                     uin: row.get(0)?,
                     nickname: row.get(1)?,
+                    historical: row.get(2)?,
+                    liked_at: row.get(3)?,
                 })
             })
             .map_err(|error| format!("查询点赞用户失败：{error}"))?;
@@ -2677,7 +3086,14 @@ pub async fn list_archive_years(
             .prepare(
                 "SELECT DISTINCT CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)
                  FROM archive_dynamics
-                 WHERE owner_uin=?1 AND category=?2 AND published_at>0
+                 WHERE owner_uin=?1 AND published_at>0
+                   AND CASE WHEN ?2='guestbook' THEN
+                     (category='guestbook' OR EXISTS(SELECT 1 FROM archive_feeds gf
+                       WHERE gf.owner_uin=archive_dynamics.owner_uin AND gf.cell_id=archive_dynamics.cell_id AND gf.event_type=334))
+                   ELSE
+                     (category=?2 AND NOT EXISTS(SELECT 1 FROM archive_feeds gf
+                       WHERE gf.owner_uin=archive_dynamics.owner_uin AND gf.cell_id=archive_dynamics.cell_id AND gf.event_type=334))
+                   END
                  ORDER BY 1 DESC",
             )
             .map_err(|error| format!("读取归档年份失败：{error}"))?;
@@ -2825,8 +3241,11 @@ pub async fn get_archived_feed(
     drop(comments);
     let mut likes_stmt = connection
         .prepare(
-            "SELECT actor_uin,actor_name FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+            "SELECT actor_uin,actor_name,
+                    (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%'),event_time
+             FROM archive_feeds
+             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217
+             ORDER BY (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%') ASC,event_time ASC",
         )
         .map_err(|error| format!("准备点赞查询失败：{error}"))?;
     item.likes = deduplicate_likes(
@@ -2835,6 +3254,8 @@ pub async fn get_archived_feed(
                 Ok(LikeUser {
                     uin: row.get(0)?,
                     nickname: row.get(1)?,
+                    historical: row.get(2)?,
+                    liked_at: row.get(3)?,
                 })
             })
             .map_err(|error| format!("查询点赞用户失败：{error}"))?
@@ -3015,10 +3436,16 @@ fn deduplicate_likes(likes: impl IntoIterator<Item = LikeUser>) -> Vec<LikeUser>
     likes
         .into_iter()
         .filter(|like| {
-            seen.insert((
-                like.uin.clone().unwrap_or_default(),
-                like.nickname.clone().unwrap_or_default(),
-            ))
+            let uin = like.uin.as_deref().unwrap_or("").trim();
+            let nickname = like.nickname.as_deref().unwrap_or("").trim();
+            // A person may have changed nicknames between the legacy history
+            // endpoint and the current feed endpoint. QQ number is the stable
+            // identity; only fall back to the nickname when no UIN survived.
+            seen.insert(if uin.is_empty() {
+                format!("name:{nickname}")
+            } else {
+                format!("uin:{uin}")
+            })
         })
         .collect()
 }
@@ -3076,7 +3503,15 @@ fn archive_items_for_export(
         "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-         FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC"
+         FROM archive_dynamics d WHERE d.owner_uin=?1
+           AND CASE WHEN ?2='guestbook' THEN
+             (d.category='guestbook' OR EXISTS(SELECT 1 FROM archive_feeds gf
+               WHERE gf.owner_uin=d.owner_uin AND gf.cell_id=d.cell_id AND gf.event_type=334))
+           ELSE
+             (d.category=?2 AND NOT EXISTS(SELECT 1 FROM archive_feeds gf
+               WHERE gf.owner_uin=d.owner_uin AND gf.cell_id=d.cell_id AND gf.event_type=334))
+           END
+         ORDER BY d.published_at ASC"
     ).map_err(|error| format!("准备导出查询失败：{error}"))?;
     let rows = statement
         .query_map(params![owner_uin, category], |row| {
@@ -3132,8 +3567,11 @@ fn archive_items_for_export(
     drop(comments);
     let mut export_likes = connection
         .prepare(
-            "SELECT actor_uin,actor_name FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+            "SELECT actor_uin,actor_name,
+                    (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%'),event_time
+             FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217
+         ORDER BY (feed_key LIKE 'history-v2-event:%' OR feed_key LIKE 'history-event:%') ASC,event_time ASC",
         )
         .map_err(|error| format!("准备导出点赞查询失败：{error}"))?;
     for item in &mut items {
@@ -3142,6 +3580,8 @@ fn archive_items_for_export(
                 Ok(LikeUser {
                     uin: row.get(0)?,
                     nickname: row.get(1)?,
+                    historical: row.get(2)?,
+                    liked_at: row.get(3)?,
                 })
             })
             .map_err(|error| format!("查询导出点赞用户失败：{error}"))?;
@@ -3302,17 +3742,37 @@ pub async fn count_archived_feeds(
     login: tauri::State<'_, QLoginState>,
     category: String,
     year: Option<i32>,
+    query: Option<String>,
 ) -> Result<u64, String> {
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
+        let query = query
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         connection
             .query_row(
                 "SELECT COUNT(*) FROM archive_dynamics
-                 WHERE owner_uin=?1 AND category=?2
-                   AND (?3 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?3)",
-                params![owner_uin, category, year],
+                 WHERE owner_uin=?1
+                   AND CASE WHEN ?2='guestbook' THEN
+                     (category='guestbook' OR EXISTS(SELECT 1 FROM archive_feeds gf
+                       WHERE gf.owner_uin=archive_dynamics.owner_uin AND gf.cell_id=archive_dynamics.cell_id AND gf.event_type=334))
+                   ELSE
+                     (category=?2 AND NOT EXISTS(SELECT 1 FROM archive_feeds gf
+                       WHERE gf.owner_uin=archive_dynamics.owner_uin AND gf.cell_id=archive_dynamics.cell_id AND gf.event_type=334))
+                   END
+                   AND (?3 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?3)
+                   AND (?4 IS NULL
+                     OR instr(lower(COALESCE(content,'')),lower(?4))>0
+                     OR instr(lower(COALESCE(author_name,'')),lower(?4))>0
+                     OR instr(COALESCE(author_uin,''),?4)>0
+                     OR EXISTS(SELECT 1 FROM archive_feeds sf
+                       WHERE sf.owner_uin=archive_dynamics.owner_uin AND sf.cell_id=archive_dynamics.cell_id
+                         AND (instr(lower(COALESCE(sf.event_summary,'')),lower(?4))>0
+                           OR instr(lower(COALESCE(sf.actor_name,'')),lower(?4))>0
+                           OR instr(COALESCE(sf.actor_uin,''),?4)>0)))",
+                params![owner_uin, category, year, query],
                 |row| row.get::<_, i64>(0),
             )
             .map(|count| count.max(0) as u64)
@@ -3340,8 +3800,11 @@ pub async fn get_archive_overview(
         .max(0) as u64;
     let (likes, comments) = connection
         .query_row(
-            "SELECT COALESCE(SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END),0)
+            "SELECT
+                COUNT(DISTINCT CASE WHEN event_type=217
+                  THEN COALESCE(cell_id,'')||'|'||COALESCE(actor_uin,'') END),
+                COUNT(DISTINCT CASE WHEN event_type IN (2,311)
+                  THEN COALESCE(cell_id,'')||'|'||COALESCE(actor_uin,'')||'|'||event_time END)
          FROM archive_feeds WHERE owner_uin=?1",
             params![owner_uin],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -3375,14 +3838,20 @@ pub async fn get_interaction_ranking(
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
-            "SELECT actor_uin,COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),COUNT(*),
-                SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END)
+            "SELECT actor_uin,COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),
+                COUNT(DISTINCT CASE WHEN event_type=217
+                  THEN COALESCE(cell_id,'')||'|'||actor_uin END)
+                  + COUNT(DISTINCT CASE WHEN event_type IN (2,311)
+                  THEN COALESCE(cell_id,'')||'|'||actor_uin||'|'||event_time END),
+                COUNT(DISTINCT CASE WHEN event_type=217
+                  THEN COALESCE(cell_id,'')||'|'||actor_uin END),
+                COUNT(DISTINCT CASE WHEN event_type IN (2,311)
+                  THEN COALESCE(cell_id,'')||'|'||actor_uin||'|'||event_time END)
          FROM archive_feeds
          WHERE owner_uin=?1 AND actor_uin IS NOT NULL AND actor_uin<>'' AND actor_uin<>?1
            AND event_type IN (2,217,311)
          GROUP BY actor_uin
-         ORDER BY COUNT(*) DESC,MAX(event_time) DESC
+         ORDER BY 3 DESC,MAX(event_time) DESC
          LIMIT ?2",
         )
         .map_err(|error| format!("准备互动排行榜查询失败：{error}"))?;
@@ -3533,15 +4002,20 @@ pub async fn list_interactors(
     let mut statement = connection
         .prepare(
             "SELECT actor_uin, COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),
-                    COUNT(*),
-                    SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END),
+                    COUNT(DISTINCT CASE WHEN event_type=217
+                      THEN COALESCE(cell_id,'')||'|'||actor_uin END)
+                      + COUNT(DISTINCT CASE WHEN event_type IN (2,311)
+                      THEN COALESCE(cell_id,'')||'|'||actor_uin||'|'||event_time END),
+                    COUNT(DISTINCT CASE WHEN event_type=217
+                      THEN COALESCE(cell_id,'')||'|'||actor_uin END),
+                    COUNT(DISTINCT CASE WHEN event_type IN (2,311)
+                      THEN COALESCE(cell_id,'')||'|'||actor_uin||'|'||event_time END),
                     MAX(event_time)
              FROM archive_feeds
              WHERE owner_uin=?1 AND actor_uin IS NOT NULL AND actor_uin<>'' AND actor_uin<>?1
                AND event_type IN (2,217,311)
              GROUP BY actor_uin
-             ORDER BY COUNT(*) DESC",
+             ORDER BY 3 DESC",
         )
         .map_err(|error| format!("准备联系人查询失败：{error}"))?;
     let rows = statement
@@ -3625,14 +4099,691 @@ pub async fn list_contact_comment_threads(
     .map_err(|error| format!("联系人评论查询任务异常退出：{error}"))?
 }
 
+fn validate_library_module(module: &str) -> Result<(), String> {
+    match module {
+        "albums" | "photos" | "videos" | "guestbook" | "favorites" => Ok(()),
+        _ => Err("无效的资料归档模块".into()),
+    }
+}
+
+fn value_text(value: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        let entry = value.get(*name)?;
+        let text = entry
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| entry.as_i64().map(|number| number.to_string()))
+            .or_else(|| entry.as_u64().map(|number| number.to_string()))?;
+        (!text.trim().is_empty()).then(|| text.trim().to_owned())
+    })
+}
+
+fn value_i64(value: &Value, names: &[&str]) -> i64 {
+    names
+        .iter()
+        .find_map(|name| {
+            let entry = value.get(*name)?;
+            entry
+                .as_i64()
+                .or_else(|| entry.as_u64().and_then(|number| i64::try_from(number).ok()))
+                .or_else(|| entry.as_str()?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn library_created_at(value: &Value) -> i64 {
+    for name in [
+        "uploadtime",
+        "uploadTime",
+        "createtime",
+        "create_time",
+        "pubtime",
+        "time",
+        "modifytime",
+    ] {
+        let Some(entry) = value.get(name) else {
+            continue;
+        };
+        let numeric = entry
+            .as_i64()
+            .or_else(|| entry.as_u64().and_then(|number| i64::try_from(number).ok()))
+            .or_else(|| {
+                entry
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<i64>().ok())
+            })
+            .unwrap_or(0);
+        if numeric > 0 {
+            return if numeric > 10_000_000_000 {
+                numeric / 1_000
+            } else {
+                numeric
+            };
+        }
+        if let Some(text) = entry.as_str() {
+            let parsed = qzone::parse_history_timestamp(text);
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    0
+}
+
+fn html_to_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut inside_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => inside_tag = true,
+            '>' => {
+                inside_tag = false;
+                if !output.ends_with(' ') {
+                    output.push(' ');
+                }
+            }
+            _ if !inside_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_library_media(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let normalized = key.to_ascii_lowercase();
+                let is_media_key = matches!(
+                    normalized.as_str(),
+                    "raw"
+                        | "pre"
+                        | "origin"
+                        | "origin_url"
+                        | "downloadurl"
+                        | "download_url"
+                        | "coverurl"
+                        | "cover_url"
+                        | "picurl"
+                        | "pic_url"
+                        | "image_url"
+                        | "video_url"
+                        | "play_url"
+                        | "url"
+                ) || normalized.contains("image")
+                    || normalized.contains("thumb")
+                    || normalized.contains("cover");
+                if is_media_key {
+                    if let Some(url) = child.as_str().map(str::trim) {
+                        if (url.starts_with("http://") || url.starts_with("https://"))
+                            && !urls.iter().any(|existing| existing == url)
+                        {
+                            urls.push(url.to_owned());
+                        }
+                    }
+                }
+                if child.is_array() || child.is_object() {
+                    collect_library_media(child, urls);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(url) = item.as_str().map(str::trim) {
+                    if (url.starts_with("http://") || url.starts_with("https://"))
+                        && !urls.iter().any(|existing| existing == url)
+                    {
+                        urls.push(url.to_owned());
+                    }
+                } else {
+                    collect_library_media(item, urls);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parsed_library_page(module: &str, value: &Value) -> ParsedLibraryPage {
+    let data = value.get("data").unwrap_or(value);
+    let (array_names, total_names): (&[&str], &[&str]) = match module {
+        "albums" => (&["albumList", "albumsInUser"], &["total", "albumTotal"]),
+        "photos" => (&["photoList", "photos"], &["totalInAlbum", "total"]),
+        "videos" => (&["Videos", "videos"], &["total", "videoTotal"]),
+        "guestbook" => (&["commentList", "comments"], &["total", "commentTotal"]),
+        "favorites" => (&["fav_list", "favorites"], &["total_num", "total"]),
+        _ => (&[], &[]),
+    };
+    let items = array_names
+        .iter()
+        .find_map(|name| data.get(*name).and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default();
+    let total = value_i64(data, total_names).max(items.len() as i64) as usize;
+    ParsedLibraryPage { items, total }
+}
+
+fn library_item_fields(
+    module: &str,
+    raw: &Value,
+    parent_key: &str,
+) -> (
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+) {
+    let key_names: &[&str] = match module {
+        "albums" => &["id", "albumid", "albumId", "topicId"],
+        "photos" => &["lloc", "sloc", "picKey", "id", "photoId"],
+        "videos" => &["vid", "shuoshuoid", "id", "videoId"],
+        "guestbook" => &["id", "commentid", "commentId", "sign"],
+        "favorites" => &["id", "fav_id", "favId", "key"],
+        _ => &[],
+    };
+    let item_key = value_text(raw, key_names)
+        .unwrap_or_else(|| format!("fallback:{:016x}", stable_feed_hash(raw)));
+    let created_at = library_created_at(raw);
+    let title_names: &[&str] = match module {
+        "albums" => &["name", "title"],
+        "photos" => &["name", "title", "desc"],
+        "videos" => &["title", "name"],
+        "guestbook" => &["nickname", "nick", "title"],
+        "favorites" => &["title", "name"],
+        _ => &[],
+    };
+    let summary_names: &[&str] = match module {
+        "albums" | "photos" => &["desc", "description", "name"],
+        "videos" => &["desc", "description", "title", "name"],
+        "guestbook" => &["htmlContent", "content", "message"],
+        "favorites" => &["abstract", "summary", "content", "title"],
+        _ => &[],
+    };
+    let title = value_text(raw, title_names).unwrap_or_else(|| {
+        match module {
+            "albums" => "未命名相册",
+            "photos" => "未命名照片",
+            "videos" => "未命名视频",
+            "guestbook" => "空间留言",
+            "favorites" => "收藏内容",
+            _ => "归档内容",
+        }
+        .into()
+    });
+    let summary = html_to_text(&value_text(raw, summary_names).unwrap_or_default());
+    let author_uin = value_text(raw, &["uin", "author_uin", "ownerUin", "custom_uin"]);
+    let author_name = value_text(raw, &["nickname", "nick", "author_name", "custom_name"]);
+    let mut media_urls = Vec::new();
+    collect_library_media(raw, &mut media_urls);
+    let cover_url = media_urls
+        .iter()
+        .find(|url| {
+            let lower = url.to_ascii_lowercase();
+            !lower.contains(".mp4") && !lower.contains(".m3u8")
+        })
+        .cloned();
+    let _ = parent_key;
+    (
+        item_key,
+        created_at,
+        title,
+        summary,
+        author_uin,
+        author_name,
+        cover_url,
+        media_urls,
+    )
+}
+
+fn save_library_page(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    module: &str,
+    scope_key: &str,
+    parent_key: &str,
+    raw_items: &[Value],
+) -> Result<u64, String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始保存资料归档失败：{error}"))?;
+    let mut saved = 0_u64;
+    let mut seen = HashSet::new();
+    for raw in raw_items {
+        let (item_key, created_at, title, summary, author_uin, author_name, cover_url, media_urls) =
+            library_item_fields(module, raw, parent_key);
+        if !seen.insert(item_key.clone()) {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO archive_library_items
+             (owner_uin,module,scope_key,item_key,parent_key,created_at,title,summary,author_uin,author_name,cover_url,media_json,raw_json,archived_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(owner_uin,module,scope_key,item_key) DO UPDATE SET
+               parent_key=excluded.parent_key,
+               created_at=CASE WHEN excluded.created_at>0 THEN excluded.created_at ELSE archive_library_items.created_at END,
+               title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE archive_library_items.title END,
+               summary=CASE WHEN excluded.summary<>'' THEN excluded.summary ELSE archive_library_items.summary END,
+               author_uin=COALESCE(excluded.author_uin,archive_library_items.author_uin),
+               author_name=COALESCE(excluded.author_name,archive_library_items.author_name),
+               cover_url=COALESCE(excluded.cover_url,archive_library_items.cover_url),
+               media_json=CASE WHEN excluded.media_json<>'[]' THEN excluded.media_json ELSE archive_library_items.media_json END,
+               raw_json=excluded.raw_json,archived_at=excluded.archived_at",
+            params![
+                owner_uin, module, scope_key, item_key, parent_key, created_at, title, summary,
+                author_uin, author_name, cover_url,
+                serde_json::to_string(&media_urls).unwrap_or_else(|_| "[]".into()),
+                raw.to_string(), now()
+            ],
+        ).map_err(|error| format!("保存资料归档失败：{error}"))?;
+        saved += 1;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交资料归档失败：{error}"))?;
+    Ok(saved)
+}
+
+fn save_library_state(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    module: &str,
+    scope_key: &str,
+    remote_total: usize,
+    fetched: usize,
+    complete: bool,
+    last_error: Option<&str>,
+) -> Result<(), String> {
+    let connection = open_database(app)?;
+    connection.execute(
+        "INSERT INTO archive_library_state(owner_uin,module,scope_key,remote_total,fetched,complete,last_error,synced_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(owner_uin,module,scope_key) DO UPDATE SET
+           remote_total=excluded.remote_total,fetched=excluded.fetched,complete=excluded.complete,
+           last_error=excluded.last_error,synced_at=excluded.synced_at",
+        params![owner_uin,module,scope_key,remote_total as i64,fetched as i64,complete,last_error,now()],
+    ).map_err(|error| format!("保存资料同步状态失败：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn sync_qzone_library(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    page_token: tauri::State<'_, qzone::QzonePageTokenState>,
+    module: String,
+    parent_key: Option<String>,
+) -> Result<LibrarySyncResult, String> {
+    validate_library_module(&module)?;
+    let scope_key = parent_key.clone().unwrap_or_default();
+    if module == "photos" && scope_key.trim().is_empty() {
+        return Err("请选择需要同步的相册".into());
+    }
+    let owner_uin = login.qzone_auth().await?.uin;
+    let page_size = qzone::library_page_size(&module);
+    let mut offset = 0_usize;
+    let mut fetched = 0_usize;
+    let mut saved = 0_u64;
+    let mut remote_total = 0_usize;
+    let mut complete = false;
+    let mut favorite_diagnostic = None;
+    for page_index in 0..1000_usize {
+        let response = match qzone::fetch_library_page(
+            &app,
+            &login,
+            &page_token,
+            &module,
+            offset,
+            parent_key.as_deref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = save_library_state(
+                    &app,
+                    &owner_uin,
+                    &module,
+                    &scope_key,
+                    remote_total,
+                    fetched,
+                    false,
+                    Some(&error),
+                );
+                return Err(format!(
+                    "{error}。已保留本次之前成功保存的 {saved} 条记录，可稍后继续同步"
+                ));
+            }
+        };
+        if module == "favorites" && favorite_diagnostic.is_none() {
+            favorite_diagnostic = response.get("_qza_diagnostic").cloned();
+        }
+        let page = parsed_library_page(&module, &response);
+        remote_total = remote_total.max(page.total);
+        let page_len = page.items.len();
+        saved += save_library_page(
+            &app,
+            &owner_uin,
+            &module,
+            &scope_key,
+            &scope_key,
+            &page.items,
+        )?;
+        fetched += page_len;
+        offset += page_len;
+        complete =
+            page_len == 0 || (remote_total > 0 && offset >= remote_total) || page_len < page_size;
+        save_library_state(
+            &app,
+            &owner_uin,
+            &module,
+            &scope_key,
+            remote_total,
+            fetched,
+            complete,
+            None,
+        )?;
+        if complete || module == "albums" {
+            break;
+        }
+        if page_index > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        }
+    }
+    let message = if complete && module == "favorites" && fetched == 0 {
+        let token_present = favorite_diagnostic
+            .as_ref()
+            .and_then(|value| value.get("qzonetoken_present"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let contract_present = favorite_diagnostic
+            .as_ref()
+            .and_then(|value| value.get("data_keys"))
+            .and_then(Value::as_array)
+            .is_some_and(|keys| {
+                keys.iter()
+                    .filter_map(Value::as_str)
+                    .any(|key| key == "fav_list")
+                    && keys
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|key| key == "total_num")
+            });
+        if contract_present {
+            let token_note = if token_present {
+                "（同时取得桌面页面令牌）"
+            } else {
+                "（按兼容契约使用登录 Cookie 与 g_tk，未发送空令牌）"
+            };
+            format!(
+                "QQ 空间旧收藏接口{token_note}返回标准字段但报告 0 条；这不代表手机 QQ 的通用收藏为空，两者不是同一资料源"
+            )
+        } else {
+            "QQ 空间旧收藏接口返回 0 条且响应结构不含标准 fav_list/total_num 字段，接口可能已变更，不能据此判定收藏为空".to_owned()
+        }
+    } else if complete && module == "guestbook" {
+        format!(
+            "同步完成：当前留言接口读取 {fetched} 条，本地更新 {saved} 条；留言板还会自动合并说说归档中恢复的历史留言残留"
+        )
+    } else if complete {
+        format!("同步完成：接口读取 {fetched} 条，本地更新 {saved} 条")
+    } else {
+        format!("同步达到安全页数上限：已读取 {fetched} 条，请再次同步继续核验")
+    };
+    Ok(LibrarySyncResult {
+        module,
+        fetched: fetched as u64,
+        saved,
+        remote_total: remote_total as u64,
+        complete,
+        message,
+    })
+}
+
+#[tauri::command]
+pub async fn list_qzone_library(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    module: String,
+    parent_key: Option<String>,
+    query: Option<String>,
+    year: Option<i32>,
+    limit: i64,
+    offset: i64,
+) -> Result<LibraryPage, String> {
+    validate_library_module(&module)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let scope_key = parent_key.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let search = query.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+        // Keep every raw row in SQLite, but collapse byte-for-byte equivalent
+        // API records when presenting the library. Legacy Qzone endpoints can
+        // repeat the boundary item of adjacent pages. The dedicated guestbook
+        // also includes deleted messages recovered from the historical
+        // interaction stream; those records are not returned by get_msgb.
+        let total = connection.query_row(
+            "WITH source AS (
+               SELECT id,module,item_key,parent_key,created_at,title,summary,author_uin,author_name,cover_url,media_json
+               FROM archive_library_items
+               WHERE owner_uin=?1 AND module=?2 AND scope_key=?3
+                 AND (?4 IS NULL OR CAST(strftime('%Y',created_at,'unixepoch','localtime') AS INTEGER)=?4)
+                 AND (?5 IS NULL OR instr(lower(title),lower(?5))>0 OR instr(lower(summary),lower(?5))>0
+                   OR instr(lower(COALESCE(author_name,'')),lower(?5))>0 OR instr(COALESCE(author_uin,''),?5)>0)
+               UNION ALL
+               SELECT -id,'guestbook','history:'||cell_id,'',published_at,
+                      COALESCE(NULLIF(author_name,''),'空间留言'),COALESCE(content,''),author_uin,author_name,NULL,'[]'
+               FROM archive_dynamics
+               WHERE owner_uin=?1 AND ?2='guestbook' AND ?3='' AND category='guestbook'
+                 AND (?4 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?4)
+                 AND (?5 IS NULL OR instr(lower(COALESCE(content,'')),lower(?5))>0
+                   OR instr(lower(COALESCE(author_name,'')),lower(?5))>0 OR instr(COALESCE(author_uin,''),?5)>0)
+             ), ranked AS (
+               SELECT ROW_NUMBER() OVER (
+                 PARTITION BY created_at,title,summary,COALESCE(author_uin,''),COALESCE(author_name,''),
+                              COALESCE(cover_url,''),media_json
+                 ORDER BY id DESC
+               ) AS duplicate_rank
+               FROM source
+             ) SELECT COUNT(*) FROM ranked WHERE duplicate_rank=1",
+            params![owner_uin,module,scope_key,year,search],
+            |row| row.get::<_, i64>(0),
+        ).map_err(|error| format!("统计资料归档失败：{error}"))?;
+        let mut statement = connection.prepare(
+            "WITH source AS (
+               SELECT id,module,item_key,parent_key,created_at,title,summary,author_uin,author_name,cover_url,media_json
+               FROM archive_library_items
+               WHERE owner_uin=?1 AND module=?2 AND scope_key=?3
+                 AND (?4 IS NULL OR CAST(strftime('%Y',created_at,'unixepoch','localtime') AS INTEGER)=?4)
+                 AND (?5 IS NULL OR instr(lower(title),lower(?5))>0 OR instr(lower(summary),lower(?5))>0
+                   OR instr(lower(COALESCE(author_name,'')),lower(?5))>0 OR instr(COALESCE(author_uin,''),?5)>0)
+               UNION ALL
+               SELECT -id,'guestbook','history:'||cell_id,'',published_at,
+                      COALESCE(NULLIF(author_name,''),'空间留言'),COALESCE(content,''),author_uin,author_name,NULL,'[]'
+               FROM archive_dynamics
+               WHERE owner_uin=?1 AND ?2='guestbook' AND ?3='' AND category='guestbook'
+                 AND (?4 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?4)
+                 AND (?5 IS NULL OR instr(lower(COALESCE(content,'')),lower(?5))>0
+                   OR instr(lower(COALESCE(author_name,'')),lower(?5))>0 OR instr(COALESCE(author_uin,''),?5)>0)
+             ), ranked AS (
+               SELECT id,module,item_key,parent_key,created_at,title,summary,author_uin,author_name,cover_url,media_json,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY created_at,title,summary,COALESCE(author_uin,''),COALESCE(author_name,''),
+                                     COALESCE(cover_url,''),media_json
+                        ORDER BY id DESC
+                      ) AS duplicate_rank
+               FROM source
+             )
+             SELECT id,module,item_key,parent_key,created_at,title,summary,author_uin,author_name,cover_url,media_json
+             FROM ranked WHERE duplicate_rank=1
+             ORDER BY created_at DESC,id DESC LIMIT ?6 OFFSET ?7"
+        ).map_err(|error| format!("准备资料归档查询失败：{error}"))?;
+        let rows = statement.query_map(
+            params![owner_uin,module,scope_key,year,search,limit.clamp(1,200),offset.max(0)],
+            |row| {
+                let media_json: String = row.get(10)?;
+                Ok(LibraryItem {
+                    id: row.get(0)?, module: row.get(1)?, item_key: row.get(2)?, parent_key: row.get(3)?,
+                    created_at: row.get(4)?, title: row.get(5)?, summary: row.get(6)?, author_uin: row.get(7)?,
+                    author_name: row.get(8)?, cover_url: row.get(9)?,
+                    media_urls: serde_json::from_str(&media_json).unwrap_or_default(),
+                })
+            }
+        ).map_err(|error| format!("查询资料归档失败：{error}"))?;
+        let items = rows.collect::<Result<Vec<_>,_>>().map_err(|error| format!("读取资料归档失败：{error}"))?;
+        let state = connection.query_row(
+            "SELECT remote_total,complete,synced_at,last_error FROM archive_library_state WHERE owner_uin=?1 AND module=?2 AND scope_key=?3",
+            params![owner_uin,module,scope_key],
+            |row| Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?,row.get::<_,i64>(2)?,row.get::<_,Option<String>>(3)?)),
+        ).unwrap_or((0,false,0,None));
+        Ok(LibraryPage { items, total: total.max(0) as u64, remote_total: state.0.max(0) as u64, complete: state.1, synced_at: state.2, last_error: state.3 })
+    }).await.map_err(|error| format!("资料归档查询任务异常退出：{error}"))?
+}
+
+#[tauri::command]
+pub async fn list_qzone_library_years(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    module: String,
+    parent_key: Option<String>,
+) -> Result<Vec<i32>, String> {
+    validate_library_module(&module)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let scope_key = parent_key.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let mut statement = connection.prepare(
+            "WITH timestamps AS (
+               SELECT created_at FROM archive_library_items
+               WHERE owner_uin=?1 AND module=?2 AND scope_key=?3 AND created_at>0
+               UNION
+               SELECT published_at FROM archive_dynamics
+               WHERE owner_uin=?1 AND ?2='guestbook' AND ?3='' AND category='guestbook' AND published_at>0
+             )
+             SELECT DISTINCT CAST(strftime('%Y',created_at,'unixepoch','localtime') AS INTEGER)
+             FROM timestamps ORDER BY 1 DESC"
+        ).map_err(|error| format!("读取资料归档年份失败：{error}"))?;
+        let rows = statement.query_map(params![owner_uin,module,scope_key], |row| row.get(0))
+            .map_err(|error| format!("查询资料归档年份失败：{error}"))?;
+        rows.collect::<Result<Vec<_>,_>>().map_err(|error| format!("读取资料归档年份失败：{error}"))
+    }).await.map_err(|error| format!("资料归档年份任务异常退出：{error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         advance_feed_cursor, archive_page_delay_ms, canonical_qzone_cell_id, checkpoint_is_stale,
-        comment_from_values, merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs,
-        skip_probe_offsets, ArchiveCheckpoint, FeedCursorDetails,
+        comment_from_values, library_created_at, merge_comments, migrate_history_guestbook_records,
+        migrate_library_guestbook_timestamps, parse_feed, parse_feed_cursor, serialize_query_pairs,
+        skip_probe_offsets, video_cover_url, video_urls, ArchiveCheckpoint, FeedCursorDetails,
     };
+    use rusqlite::{params, Connection};
     use serde_json::json;
+
+    #[test]
+    fn parses_guestbook_wall_clock_time_after_zero_modify_time() {
+        let created_at = library_created_at(&json!({
+            "modifytime": 0,
+            "pubtime": "2020-08-08 06:40:11"
+        }));
+        assert_eq!(created_at, 1_596_840_011);
+    }
+
+    #[test]
+    fn repairs_existing_guestbook_rows_with_string_timestamps() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE archive_migrations(name TEXT PRIMARY KEY,applied_at INTEGER NOT NULL);
+             CREATE TABLE archive_library_items(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,module TEXT NOT NULL,created_at INTEGER NOT NULL,
+               raw_json TEXT NOT NULL
+             );
+             INSERT INTO archive_library_items(module,created_at,raw_json)
+             VALUES ('guestbook',0,'{\"modifytime\":0,\"pubtime\":\"2020-08-08 06:40:11\"}');"
+        ).unwrap();
+        migrate_library_guestbook_timestamps(&mut connection).unwrap();
+        let created_at = connection
+            .query_row(
+                "SELECT created_at FROM archive_library_items LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, 1_596_840_011);
+    }
+
+    #[test]
+    fn migrates_colliding_history_guestbooks_into_unique_guestbook_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE archive_migrations(name TEXT PRIMARY KEY,applied_at INTEGER NOT NULL);
+                 CREATE TABLE archive_dynamics(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,owner_uin TEXT NOT NULL,cell_id TEXT NOT NULL,
+                   published_at INTEGER NOT NULL,content TEXT,author_uin TEXT,author_name TEXT,
+                   category TEXT NOT NULL,pictures_json TEXT,video_json TEXT,raw_original_json TEXT NOT NULL,
+                   archived_at INTEGER NOT NULL,UNIQUE(owner_uin,cell_id));
+                 CREATE TABLE archive_feeds(
+                   owner_uin TEXT NOT NULL,feed_key TEXT NOT NULL,cell_id TEXT,event_type INTEGER NOT NULL,
+                   event_time INTEGER NOT NULL,actor_uin TEXT,actor_name TEXT,content TEXT,event_summary TEXT,
+                   raw_json TEXT NOT NULL,PRIMARY KEY(owner_uin,feed_key));",
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO archive_dynamics(owner_uin,cell_id,published_at,content,author_uin,author_name,category,raw_original_json,archived_at)
+             VALUES ('1','history-v2:blank',0,'留言：','1','本人','self','{}',1)",
+            [],
+        ).unwrap();
+        for (key, time, actor, name, content) in [
+            (
+                "history-v2-event:fct_2_334_1_100_1_1",
+                100_i64,
+                "2",
+                "甲",
+                "留言：第一条",
+            ),
+            (
+                "history-v2-event:fct_3_334_1_200_1_1",
+                200_i64,
+                "3",
+                "乙",
+                "留言：第二条",
+            ),
+        ] {
+            connection.execute(
+                "INSERT INTO archive_feeds(owner_uin,feed_key,cell_id,event_type,event_time,actor_uin,actor_name,content,event_summary,raw_json)
+                 VALUES ('1',?1,'history-v2:blank',334,?2,?3,?4,?5,?5,?6)",
+                params![key, time, actor, name, content, json!({"original": {}}).to_string()],
+            ).unwrap();
+        }
+
+        migrate_history_guestbook_records(&mut connection).unwrap();
+
+        let guestbooks: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM archive_dynamics WHERE category='guestbook' AND published_at>0",
+            [], |row| row.get(0),
+        ).unwrap();
+        let stale: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_dynamics WHERE cell_id='history-v2:blank'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guestbooks, 2);
+        assert_eq!(stale, 0);
+    }
 
     #[test]
     fn parses_like_event_sample_shape() {
@@ -3889,6 +5040,31 @@ mod tests {
             Some("b327e67270f89d62e24a0e00")
         );
         assert_eq!(canonical_qzone_cell_id("history-v2:abc"), None);
+    }
+
+    #[test]
+    fn reads_video_fallbacks_from_legacy_and_normalized_shapes() {
+        let value = json!({
+            "videourl": "https://example.com/high.mp4",
+            "actionurl": "https://example.com/action.mp4",
+            "videourls": {
+                "5": {"url": "https://example.com/low.mp4"},
+                "9": {"url": "https://example.com/high.mp4"}
+            },
+            "coverurl": "https://example.com/cover.jpg"
+        });
+        assert_eq!(
+            video_urls(Some(value.to_string())),
+            vec![
+                "https://example.com/high.mp4",
+                "https://example.com/action.mp4",
+                "https://example.com/low.mp4"
+            ]
+        );
+        assert_eq!(
+            video_cover_url(Some(value.to_string())).as_deref(),
+            Some("https://example.com/cover.jpg")
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { platform } from "@tauri-apps/plugin-os";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { storeToRefs } from "pinia";
 import Button from "primevue/button";
 import Checkbox from "primevue/checkbox";
@@ -8,7 +10,8 @@ import InputText from "primevue/inputtext";
 import Select from "primevue/select";
 import { useAuthStore } from "../stores/auth";
 import { useRecycleSessionStore } from "../stores/recycle";
-import { checkRecyclePassword, closeRecyclePasswordWindow, createQzoneAlbum, listQzoneAlbums, listRecycleAlbums, listRecyclePhotos, loadRecyclePhotoPreview, openRecyclePasswordWindow, recoverRecycleAlbum, recoverRecyclePhotos } from "../utils/qzone";
+import { syncCookiesToWebview } from "../utils/qlogin";
+import { checkRecyclePassword, closeRecyclePasswordWindow, createQzoneAlbum, listQzoneAlbums, listRecycleAlbums, listRecyclePhotos, loadRecyclePhotoPreview, openRecyclePasswordWindow, prepareRecyclePasswordWindow, recoverRecycleAlbum, recoverRecyclePhotos } from "../utils/qzone";
 
 interface Album { id: string; name: string; count: number }
 interface Photo { id: string; sourceAlbumId: string; name: string; url?: string; deletedAt?: string }
@@ -83,7 +86,25 @@ async function verify() {
   if (!auth.loggedIn) { await auth.openLogin(); return; }
   const run = ++verifyRun; verifying.value = true; error.value = "";
   try {
-    await openRecyclePasswordWindow();
+    if (platform() === "macos") {
+      // Creating this legacy QQ page from a Rust async command has caused
+      // WKWebView process aborts on macOS. Let Tauri's JS window manager own
+      // the window and keep the page free of injected scripts instead.
+      const url = await prepareRecyclePasswordWindow();
+      await syncCookiesToWebview();
+      const existing = await WebviewWindow.getByLabel("qzone-recycle-auth");
+      if (existing) await existing.close();
+      const verificationWindow = new WebviewWindow("qzone-recycle-auth", {
+        url, title: "验证 QQ 空间独立密码", width: 960, height: 720,
+        minWidth: 560, minHeight: 520, center: true, focus: true,
+      });
+      await new Promise<void>((resolve, reject) => {
+        void verificationWindow.once("tauri://created", () => resolve());
+        void verificationWindow.once("tauri://error", (event) => reject(new Error(String(event.payload))));
+      });
+    } else {
+      await openRecyclePasswordWindow();
+    }
     while (run === verifyRun && verifying.value) {
       const result = await checkRecyclePassword();
       if (result) { recycleSession.setVerified(result, auth.user?.uin ?? ""); verifying.value = false; await closeRecyclePasswordWindow(); await loadAll(); return; }
@@ -175,7 +196,7 @@ onBeforeUnmount(() => { verifyRun += 1; verifying.value = false; void closeRecyc
   <div class="recycle-page">
     <section v-if="!verified" class="surface-card empty-state recycle-auth-state">
       <span><i class="pi pi-lock" /></span><h2>需要验证 QQ 空间独立密码</h2>
-      <p>验证将在独立的内置浏览器窗口中完成。应用不会读取或保存你的密码，只接收返回的临时验证签名。</p>
+      <p>验证将在无脚本注入的独立 QQ 空间窗口中完成。应用不会读取或保存你的密码，只接收 QQ 返回的临时验证签名。</p>
       <Button :label="verifying ? '等待验证完成…' : (auth.loggedIn ? '验证独立密码' : '先登录 QQ 空间')" icon="pi pi-shield" :loading="verifying" @click="verify" />
       <small v-if="verifying" class="recycle-auth-tip">请在弹出窗口完成验证，成功后会自动刷新。</small><p v-if="error" class="recycle-error">{{ error }}</p>
     </section>

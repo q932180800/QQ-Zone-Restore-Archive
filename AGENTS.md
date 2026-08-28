@@ -24,7 +24,7 @@ Archiving is based on QQ Zone's **mobile interaction list API** (`mobile.qzone.q
 - **QR Code Login**: Invokes QQ Zone's mobile scan-to-login flow; never touches the password.
 - **Web Login** (desktop only): Opens an independent window loading the QQ login page, then extracts login credentials via the WebView Cookie API.
 
-Login credentials (cookies) are stored **only in the Rust backend memory** and are never written to the console or logs.
+Login credentials (cookies) live in Rust memory while the app runs. On supported desktop platforms, the minimal restorable session is persisted only in the operating system credential store (macOS Keychain / Windows Credential Manager / Linux Secret Service). Credentials must never be written to SQLite, frontend storage, console output, or logs.
 
 ### Project Structure
 
@@ -156,7 +156,7 @@ Before submitting a change, run the appropriate verification:
 - When frequent rate-limit prompts appear, it is recommended to continue at a different time; the application supports resumable transfer.
 - QQ video signatures have an expiration time; expired video URLs require re-archiving to refresh.
 - Data is saved in the application data directory by default; it is recommended to regularly back up important materials separately.
-- Login credentials (cookies) are kept in Rust backend memory only — never log them, write them to disk, or expose them through Tauri commands.
+- Login credentials (cookies) must never be logged, written to SQLite/plaintext files, or added to frontend persistence. Desktop persistence is allowed only through the operating system credential store and must be removed on logout or full app-data deletion.
 
 ## Disclaimer
 

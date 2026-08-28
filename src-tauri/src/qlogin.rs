@@ -11,7 +11,7 @@ use reqwest::{
     redirect::Policy,
     Client, Response,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
 use url::Url;
@@ -34,6 +34,8 @@ const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
 const XLOGIN_URL: &str = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin";
 const S_URL: &str = "https://h5.qzone.qq.com/mqzone/index";
 const PROXY_URL: &str = "";
+const CREDENTIAL_SERVICE: &str = "top.ehre.qzonearchive";
+const CREDENTIAL_ACCOUNT: &str = "qq-login-session";
 
 #[derive(Default)]
 struct LoginSession {
@@ -45,10 +47,134 @@ struct LoginSession {
     login_sig: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+struct PersistedLoginSession {
+    uin: String,
+    cookies: HashMap<String, String>,
+    user_agent: String,
+}
+
+impl PersistedLoginSession {
+    fn from_session(session: &LoginSession) -> Option<Self> {
+        let uin = session.uin.clone()?.trim().to_owned();
+        let p_skey = session.cookies.get("p_skey")?.trim();
+        if uin.is_empty() || p_skey.is_empty() || session.user_agent.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            uin,
+            cookies: session.cookies.clone(),
+            user_agent: session.user_agent.clone(),
+        })
+    }
+
+    fn into_session(self) -> Result<LoginSession, String> {
+        let uin = self.uin.trim().to_owned();
+        let g_tk = self
+            .cookies
+            .get("p_skey")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(bkn)
+            .ok_or("系统凭据中的 QQ 会话缺少 p_skey")?;
+        if uin.is_empty() || self.user_agent.trim().is_empty() {
+            return Err("系统凭据中的 QQ 会话不完整".into());
+        }
+        Ok(LoginSession {
+            cookies: self.cookies,
+            uin: Some(uin),
+            g_tk: Some(g_tk),
+            user_agent: self.user_agent,
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux"
+))]
+fn load_persisted_login() -> Result<Option<LoginSession>, String> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
+        .map_err(|error| format!("打开系统凭据库失败：{error}"))?;
+    let encoded = match entry.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(error) => return Err(format!("读取系统凭据失败：{error}")),
+    };
+    let persisted = serde_json::from_str::<PersistedLoginSession>(&encoded)
+        .map_err(|error| format!("系统凭据中的 QQ 会话无法解析：{error}"))?;
+    persisted.into_session().map(Some)
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux"
+)))]
+fn load_persisted_login() -> Result<Option<LoginSession>, String> {
+    Ok(None)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux"
+))]
+fn save_persisted_login(session: PersistedLoginSession) -> Result<(), String> {
+    let encoded = serde_json::to_string(&session)
+        .map_err(|error| format!("序列化 QQ 登录会话失败：{error}"))?;
+    keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
+        .map_err(|error| format!("打开系统凭据库失败：{error}"))?
+        .set_password(&encoded)
+        .map_err(|error| format!("保存 QQ 登录会话到系统凭据库失败：{error}"))
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux"
+)))]
+fn save_persisted_login(_session: PersistedLoginSession) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux"
+))]
+fn delete_persisted_login() -> Result<(), String> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
+        .map_err(|error| format!("打开系统凭据库失败：{error}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("清除系统凭据失败：{error}")),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "windows",
+    target_os = "linux"
+)))]
+fn delete_persisted_login() -> Result<(), String> {
+    Ok(())
+}
+
 pub struct QLoginState {
     client: Client,
     session: Mutex<Option<LoginSession>>,
     last_user_agent: Mutex<Option<String>>,
+    restore_attempted: Mutex<bool>,
 }
 
 pub(crate) struct QzoneAuth {
@@ -71,6 +197,7 @@ impl QLoginState {
             client,
             session: Mutex::new(None),
             last_user_agent: Mutex::new(None),
+            restore_attempted: Mutex::new(false),
         }
     }
 
@@ -79,6 +206,7 @@ impl QLoginState {
     }
 
     pub(crate) async fn qzone_auth(&self) -> Result<QzoneAuth, String> {
+        self.restore_session().await?;
         let guard = self.session.lock().await;
         let session = guard.as_ref().ok_or("尚未登录 QQ 空间")?;
         let g_tk = session.g_tk.ok_or("登录会话缺少 g_tk")?;
@@ -108,6 +236,50 @@ impl QLoginState {
 
     pub(crate) async fn clear_session(&self) {
         *self.session.lock().await = None;
+        *self.restore_attempted.lock().await = true;
+        match tokio::task::spawn_blocking(delete_persisted_login).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("{error}"),
+            Err(error) => eprintln!("清除系统凭据任务失败：{error}"),
+        }
+    }
+
+    async fn restore_session(&self) -> Result<bool, String> {
+        if self.session.lock().await.is_some() {
+            return Ok(true);
+        }
+        {
+            let attempted = self.restore_attempted.lock().await;
+            if *attempted {
+                return Ok(false);
+            }
+        }
+        // macOS can leave an old ad-hoc development signature waiting on a
+        // Keychain ACL prompt. Never hold the restore mutex across that
+        // blocking lookup, and never let it freeze QR/web login indefinitely.
+        let task = tokio::task::spawn_blocking(load_persisted_login);
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .map_err(|_| "读取系统凭据超时，请重新登录以授权当前应用".to_owned())?
+            .map_err(|error| format!("读取系统凭据任务失败：{error}"))??;
+        // A locked desktop session can temporarily deny keychain access. Only
+        // cache a completed lookup; transient credential-store errors must be
+        // allowed to retry after the user unlocks or focuses the app again.
+        let mut attempted = self.restore_attempted.lock().await;
+        *attempted = true;
+        if let Some(session) = restored {
+            *self.session.lock().await = Some(session);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn persist_session(&self, session: &LoginSession) -> Result<(), String> {
+        let persisted = PersistedLoginSession::from_session(session).ok_or("登录凭证不完整")?;
+        *self.restore_attempted.lock().await = true;
+        tokio::task::spawn_blocking(move || save_persisted_login(persisted))
+            .await
+            .map_err(|error| format!("保存系统凭据任务失败：{error}"))?
     }
 }
 
@@ -220,8 +392,10 @@ fn bkn(p_skey: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        bkn, callback_query_value, ptqr_token, select_mobile_user_agent, MOBILE_USER_AGENTS,
+        bkn, callback_query_value, ptqr_token, select_mobile_user_agent, LoginSession,
+        PersistedLoginSession, MOBILE_USER_AGENTS,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn login_hashes_match_reference_algorithm() {
@@ -234,6 +408,29 @@ mod tests {
         let long_value = "qrsig".repeat(1_000);
         assert!((0..=0x7fff_ffff).contains(&ptqr_token(&long_value)));
         assert!((0..=0x7fff_ffff).contains(&bkn(&long_value)));
+    }
+
+    #[test]
+    fn persisted_login_recomputes_derived_fields_without_password_data() {
+        let persisted = PersistedLoginSession {
+            uin: "1927686067".into(),
+            cookies: HashMap::from([
+                ("p_skey".into(), "test-session-key".into()),
+                ("uin".into(), "o01927686067".into()),
+            ]),
+            user_agent: MOBILE_USER_AGENTS[0].into(),
+        };
+        let encoded = serde_json::to_string(&persisted).expect("serialize persisted login");
+        assert!(!encoded.contains("ptqrtoken"));
+        assert!(!encoded.contains("login_sig"));
+        let session = serde_json::from_str::<PersistedLoginSession>(&encoded)
+            .expect("deserialize persisted login")
+            .into_session()
+            .expect("restore persisted login");
+        assert_eq!(session.uin.as_deref(), Some("1927686067"));
+        assert_eq!(session.g_tk, Some(bkn("test-session-key")));
+        assert_eq!(session.ptqrtoken, LoginSession::default().ptqrtoken);
+        assert!(session.login_sig.is_empty());
     }
 
     #[test]
@@ -430,6 +627,7 @@ async fn warmup_qzone_session(
 
 #[tauri::command]
 pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLoginStart, String> {
+    *state.restore_attempted.lock().await = true;
     let user_agent = state.next_mobile_user_agent().await;
     let (login_sig, mut cookies) = fetch_login_sig(&state.client, &user_agent).await?;
     let response = state
@@ -641,21 +839,25 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
     let warmup_ua = session.user_agent.clone();
     warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
     let auth = login_credentials(session).ok_or("登录凭证不完整")?;
+    let persistence_result = state.persist_session(session).await;
     Ok(LoginStatus {
         status: "success",
-        message: "登录成功".into(),
+        message: persistence_result
+            .map(|_| "登录成功，已安全保存会话".into())
+            .unwrap_or_else(|error| format!("登录成功，但未能持久保存会话：{error}")),
         auth: Some(auth),
     })
 }
 
 #[tauri::command]
 pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<LoginStatus, String> {
+    state.restore_session().await?;
     let guard = state.session.lock().await;
     if let Some(session) = guard.as_ref() {
         if let Some(auth) = login_credentials(session) {
             return Ok(LoginStatus {
                 status: "success",
-                message: "已登录".into(),
+                message: "已恢复上次登录".into(),
                 auth: Some(auth),
             });
         }
@@ -783,6 +985,7 @@ pub async fn check_web_login(
     };
 
     let auth = login_credentials(&session).ok_or("登录凭证不完整")?;
+    let persistence_result = state.persist_session(&session).await;
 
     if let Some(w) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
         w.close().ok();
@@ -792,7 +995,9 @@ pub async fn check_web_login(
 
     Ok(LoginStatus {
         status: "success",
-        message: "登录成功".into(),
+        message: persistence_result
+            .map(|_| "登录成功，已安全保存会话".into())
+            .unwrap_or_else(|error| format!("登录成功，但未能持久保存会话：{error}")),
         auth: Some(auth),
     })
 }

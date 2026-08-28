@@ -146,7 +146,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="media-page">
     <section class="media-hero surface-card">
-      <div class="media-hero-copy"><span class="media-hero-icon"><i class="pi pi-images" /></span><div><h2>媒体时光轴</h2><p>浏览本人和其他人动态中归档的全部照片与视频</p></div></div>
+      <div class="media-hero-copy"><span class="media-hero-icon"><i class="pi pi-images" /></span><div><h2>说说媒体</h2><p>集中浏览说说归档中的照片与视频；QQ 相册内容请在“相册”中查看</p></div></div>
       <div class="media-filter"><label for="media-year">拍摄年份</label><Select id="media-year" v-model="selectedYear" :options="yearOptions" option-label="label" option-value="value" /><span>共 {{ total }} 项</span></div>
     </section>
 

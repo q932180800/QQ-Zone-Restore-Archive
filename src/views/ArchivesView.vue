@@ -39,7 +39,6 @@ const orderOptions = [
 const categoryOptions: { label: string; value: ArchiveCategory; icon: string; hint: string }[] = [
   { label: "本人动态", value: "self", icon: "pi pi-user", hint: "由当前账号发布" },
   { label: "其他动态", value: "other", icon: "pi pi-users", hint: "好友及其他用户" },
-  { label: "留言", value: "guestbook", icon: "pi pi-envelope", hint: "空间留言板内容" },
 ];
 const categoryLabel = computed(() => categoryOptions.find((item) => item.value === category.value)?.label || "归档");
 const avatarTimestamp = ref(Date.now());
@@ -64,39 +63,50 @@ let longPressTimer: ReturnType<typeof setTimeout> | undefined;
 const expandedComments = reactive(new Set<number>());
 const expandedLikes = reactive(new Set<number>());
 let imageObserver: IntersectionObserver | undefined;
+let cardResizeObserver: ResizeObserver | undefined;
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+let loadSequence = 0;
 const currentPlatform = platform();
 const desktopPlatforms = new Set(["windows", "macos", "linux"]);
 const isDesktopPlatform = desktopPlatforms.has(currentPlatform);
 
-const filtered = computed(() => {
-  const key = query.value.trim().toLowerCase();
-  return key ? records.value.filter((item) => [item.content, item.authorName, item.authorUin].some((value) => value?.toLowerCase().includes(key))) : records.value;
-});
+const filtered = computed(() => records.value);
 const visibleIds = computed(() => filtered.value.map((item) => item.id));
 const allVisibleSelected = computed(() => visibleIds.value.length > 0 && visibleIds.value.every((id) => selectedIds.value.includes(id)));
 const confirmTitle = computed(() => pendingAction.value === "all" ? "清空全部归档？" : `删除 ${selectedIds.value.length} 条归档？`);
 const confirmDescription = computed(() => pendingAction.value === "all" ? "将永久删除当前账号的全部归档记录。" : "选中的归档记录将被永久删除。");
 const formatTime = (seconds: number) => seconds ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(seconds * 1000)) : "时间未知";
 const avatarUrl = (uin?: string) => uin ? `https://qlogo2.store.qq.com/qzone/${uin}/${uin}/50?${avatarTimestamp.value}` : "";
+const directLikes = (item: ArchiveItem) => item.likes.filter((like) => !like.historical);
+const historicalLikes = (item: ArchiveItem) => item.likes.filter((like) => like.historical);
+const visibleLikes = (item: ArchiveItem) => expandedLikes.has(item.id) ? item.likes : item.likes.slice(0, 10);
+const likeTitle = (like: ArchiveItem["likes"][number]) => [
+  like.uin ? `QQ ${like.uin}` : "QQ 号未保留",
+  like.likedAt ? `点赞于 ${formatTime(like.likedAt)}` : "点赞时间未知",
+  like.historical ? "来源：历史互动记录" : "来源：当前空间接口",
+].join(" · ");
 
 async function load() {
+  const sequence = ++loadSequence;
   releaseVideos();
   loading.value = true; error.value = "";
   try {
     const year = selectedYear.value || undefined;
+    const search = query.value.trim() || undefined;
     const [items, total, availableYears] = await Promise.all([
-      listArchivedFeeds(pageSize.value, first.value, category.value, year, descending.value),
-      countArchivedFeeds(category.value, year),
+      listArchivedFeeds(pageSize.value, first.value, category.value, year, descending.value, search),
+      countArchivedFeeds(category.value, year, search),
       listArchiveYears(category.value),
     ]);
+    if (sequence !== loadSequence) return;
     records.value = items; totalRecords.value = total; selectedIds.value = []; avatarTimestamp.value = Date.now();
     years.value = availableYears;
     if (selectedYear.value && !availableYears.includes(selectedYear.value)) selectedYear.value = 0;
     if (!items.length && first.value > 0 && total > 0) { first.value = Math.max(0, Math.floor((total - 1) / pageSize.value) * pageSize.value); await load(); }
-    else { await nextTick(); observeArchiveImages(); }
+    else { await nextTick(); observeArchiveImages(); observeArchiveCards(); }
   }
-  catch (reason) { error.value = String(reason); }
-  finally { loading.value = false; }
+  catch (reason) { if (sequence === loadSequence) error.value = String(reason); }
+  finally { if (sequence === loadSequence) loading.value = false; }
 }
 function releaseVideos() {
   imageObserver?.disconnect();
@@ -123,6 +133,19 @@ function observeArchiveImages() {
     }
   }, { rootMargin: "240px 0px" });
   document.querySelectorAll<HTMLElement>(".archive-page [data-archive-image]").forEach((element) => imageObserver?.observe(element));
+}
+function observeArchiveCards() {
+  cardResizeObserver?.disconnect();
+  cardResizeObserver = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const card = entry.target as HTMLElement;
+      const height = entry.borderBoxSize?.[0]?.blockSize || card.getBoundingClientRect().height;
+      // Keep DOM order while allowing the next record to occupy the shorter
+      // column. CSS uses 4px implicit rows with a 12px gap.
+      card.style.gridRowEnd = `span ${Math.max(1, Math.ceil((height + 12) / 16))}`;
+    }
+  });
+  document.querySelectorAll<HTMLElement>(".archive-page .archive-card").forEach((card) => cardResizeObserver?.observe(card));
 }
 async function loadArchiveImage(url: string, dynamicId?: number, pictureIndex?: number) {
   if (!url || imageSources[url] || imageLoading[url]) return;
@@ -270,7 +293,11 @@ async function confirmDelete() {
 onMounted(load);
 watch(category, () => { first.value = 0; query.value = ""; selectedYear.value = 0; void load(); });
 watch([selectedYear, descending], () => { first.value = 0; void load(); });
-onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); });
+watch(query, () => {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { first.value = 0; void load(); }, 260);
+});
+onBeforeUnmount(() => { if (searchTimer) clearTimeout(searchTimer); clearLongPress(); imageObserver?.disconnect(); cardResizeObserver?.disconnect(); releaseVideos(); });
 </script>
 
 <template>
@@ -278,7 +305,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
   <section class="archive-header surface-card">
     <div class="archive-header-copy">
       <span class="archive-header-icon"><i class="pi pi-box" /></span>
-      <div><p class="section-kicker">LOCAL ARCHIVE</p><h2>归档内容</h2><p>{{ categoryLabel }}共 {{ totalRecords }} 条，可搜索或批量管理。</p></div>
+      <div><p class="section-kicker">LOCAL ARCHIVE</p><div class="archive-title-line"><h2>归档内容</h2><span>{{ totalRecords }}</span></div><p>{{ categoryLabel }} · 按时间、年份和互动关系整理</p></div>
     </div>
     <div class="archive-header-actions">
       <Button icon="pi pi-refresh" label="刷新" severity="secondary" text :loading="loading" @click="load" />
@@ -327,16 +354,11 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         <div class="archive-assets">
           <span class="archive-likes" v-if="item.likes.length">
             <i class="pi pi-heart" />
-            <template v-if="item.likes.length <= 10 || expandedLikes.has(item.id)">
-              <span class="archive-like-names">{{ item.likes.map(l => l.nickname || l.uin || 'QQ用户').join('、') }}</span>
-              <span> 赞了</span>
-              <button v-if="item.likes.length > 10" type="button" class="archive-like-toggle" @click="expandedLikes.delete(item.id)">收起</button>
-            </template>
-            <template v-else>
-              <span class="archive-like-names">{{ item.likes.slice(0, 10).map(l => l.nickname || l.uin || 'QQ用户').join('、') }}</span>
-              <button type="button" class="archive-like-toggle" @click="expandedLikes.add(item.id)">等 {{ item.likeCount }} 人赞了</button>
-            </template>
+            <span class="archive-like-names"><template v-for="(like, likeIndex) in visibleLikes(item)" :key="`${like.uin}-${like.likedAt}-${likeIndex}`"><span class="archive-like-person" :class="{ 'is-historical': like.historical }" :title="likeTitle(like)">{{ like.nickname || like.uin || 'QQ用户' }}</span><span v-if="likeIndex < visibleLikes(item).length - 1">、</span></template></span>
+            <span>赞了</span>
+            <button v-if="item.likes.length > 10" type="button" class="archive-like-toggle" :aria-expanded="expandedLikes.has(item.id)" @click="expandedLikes.has(item.id) ? expandedLikes.delete(item.id) : expandedLikes.add(item.id)">{{ expandedLikes.has(item.id) ? '收起' : `等 ${item.likes.length} 人赞了` }}</button>
           </span>
+          <span v-if="historicalLikes(item).length" class="archive-like-history-note"><i class="pi pi-history" />其中 {{ historicalLikes(item).length }} 人来自历史互动记录，昵称与点赞时间均按原始记录展示{{ directLikes(item).length ? '' : '；该名单可能不完整' }}</span>
           <span v-if="item.commentCount"><i class="pi pi-comment" />{{ item.commentCount }} 条评论</span>
           <span v-if="item.pictureUrls.length"><i class="pi pi-images" />{{ item.pictureUrls.length }} 张图片</span>
           <span v-if="item.videoUrl"><i class="pi pi-video" />视频</span></div>

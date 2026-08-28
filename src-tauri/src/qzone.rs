@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::header::{
-    ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, ORIGIN, PRAGMA, REFERER, USER_AGENT,
+    ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, LOCATION, ORIGIN, PRAGMA, REFERER, USER_AGENT,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -37,13 +37,279 @@ const ALBUM_LIST_URL: &str =
     "https://h5.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3";
 const CREATE_ALBUM_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_add_album_v2";
+const LIBRARY_ALBUMS_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3";
+const LIBRARY_PHOTOS_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/cgi_list_photo";
+const LIBRARY_VIDEOS_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/video_get_data";
+const LIBRARY_GUESTBOOK_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/m.qzone.qq.com/cgi-bin/new/get_msgb";
+const LIBRARY_FAVORITES_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/fav.qzone.qq.com/cgi-bin/get_fav_list";
+const TOKEN_PROBE_WINDOW_LABEL: &str = "qzone-page-token-probe";
+const TOKEN_PROBE_TITLE_PREFIX: &str = "__QZA_QZONETOKEN__";
+
+#[derive(Clone, Default)]
+pub struct QzonePageTokenState {
+    token: Arc<Mutex<Option<(String, String)>>>,
+}
+
+fn extract_qzone_token(page: &str) -> Option<String> {
+    // QQ writes this token into an inline script on the authenticated desktop
+    // homepage. Keep the parser deliberately narrow so we never mistake a
+    // different script value for an authorization token.
+    let compact = page.replace(char::is_whitespace, "");
+    regex::Regex::new(
+        r#"window\.g_qzonetoken=\(function\(\)\{.*?return[\"']([A-Za-z0-9_-]+)[\"'];"#,
+    )
+    .ok()?
+    .captures(&compact)
+    .and_then(|captures| captures.get(1))
+    .map(|token| token.as_str().to_owned())
+    .filter(|token| !token.is_empty())
+}
+
+fn extract_qzone_token_expression(page: &str) -> Option<String> {
+    // Some Qzone page variants return the token as an obfuscated JavaScript
+    // expression instead of a quoted literal. Preserve only the expression
+    // after `try { return ...; }` and execute it inside an isolated WebView on
+    // the authenticated Qzone origin. It is bounded and never exposed to the
+    // application frontend.
+    let expression = regex::Regex::new(
+        r#"(?s)window\s*\.\s*g_qzonetoken\s*=\s*\(\s*function\s*\(\s*\)\s*\{\s*try\s*\{\s*return\s*(.+?)\s*;\s*\}\s*catch"#,
+    )
+    .ok()?
+    .captures(page)?
+    .get(1)?
+    .as_str()
+    .trim();
+    (!expression.is_empty() && expression.len() <= 64 * 1024).then(|| expression.to_owned())
+}
+
+async fn fetch_qzone_token_from_webview(
+    app: &tauri::AppHandle,
+    auth: &crate::qlogin::QzoneAuth,
+    token_state: &QzonePageTokenState,
+    page_expression: Option<&str>,
+) -> Option<String> {
+    if let Ok(guard) = token_state.token.lock() {
+        if let Some((uin, token)) = guard.as_ref() {
+            if uin == &auth.uin && !token.is_empty() {
+                return Some(token.clone());
+            }
+        }
+    }
+    if let Some(existing) = app.get_webview_window(TOKEN_PROBE_WINDOW_LABEL) {
+        existing.close().ok();
+    }
+    let page_url = Url::parse(&format!("https://user.qzone.qq.com/{}", auth.uin)).ok()?;
+    let encoded_expression = page_expression
+        .map(|expression| BASE64.encode(expression.as_bytes()))
+        .unwrap_or_default();
+    let probe_script = format!(
+        r#"
+        (() => {{
+          if (window.__qzaTokenProbeInstalled) return;
+          window.__qzaTokenProbeInstalled = true;
+          const publish = (value) => {{
+            const token = typeof value === 'string' ? value.trim() : '';
+            if (!/^[A-Za-z0-9_-]+$/.test(token)) return false;
+            document.title = '{TOKEN_PROBE_TITLE_PREFIX}' + token;
+            try {{
+              window.location.replace('qza-qzonetoken://capture/' + encodeURIComponent(token));
+            }} catch (_) {{}}
+            return true;
+          }};
+          const inspect = () => {{
+            try {{ if (publish(window.g_qzonetoken)) return; }} catch (_) {{}}
+            try {{
+              const encoded = '{encoded_expression}';
+              if (encoded) {{
+                const expression = atob(encoded);
+                if (publish((0, eval)('(' + expression + ')'))) return;
+              }}
+            }} catch (_) {{}}
+            try {{
+              for (const script of document.scripts || []) {{
+                const compact = String(script.textContent || '').replace(/\s+/g, '');
+                if (!compact.includes('window.g_qzonetoken')) continue;
+                const match = compact.match(/return[\"']([A-Za-z0-9_-]+)[\"'];/);
+                if (match && publish(match[1])) return;
+              }}
+            }} catch (_) {{}}
+          }};
+          inspect();
+          const timer = setInterval(inspect, 200);
+          setTimeout(() => clearInterval(timer), 12000);
+          document.addEventListener('DOMContentLoaded', inspect, {{ once: true }});
+        }})();
+        "#
+    );
+    let capture_state = token_state.clone();
+    let capture_uin = auth.uin.clone();
+    let window = WebviewWindowBuilder::new(
+        app,
+        TOKEN_PROBE_WINDOW_LABEL,
+        WebviewUrl::External(page_url.clone()),
+    )
+    .title("QQ 空间会话校验")
+    .visible(false)
+    .initialization_script(&probe_script)
+    .on_navigation(move |url| {
+        if url.scheme() == "qza-qzonetoken" && url.host_str() == Some("capture") {
+            if let Some(token) = url.path_segments().and_then(|mut segments| segments.next()) {
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+                {
+                    if let Ok(mut guard) = capture_state.token.lock() {
+                        *guard = Some((capture_uin.clone(), token.to_owned()));
+                    }
+                }
+            }
+            return false;
+        }
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host == "qzone.qq.com" || host.ends_with(".qzone.qq.com"))
+    })
+    .build()
+    .ok()?;
+    // The login session is already narrowed to QQ's authentication cookies.
+    // Populate the shared WebKit/WebView cookie store before reloading the
+    // authenticated page; the token never leaves this native process.
+    for pair in auth.cookie_header.split(';') {
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let cookie_text = format!("{name}={value}; Domain=.qq.com; Path=/; Secure");
+        if let Ok(cookie) = cookie_text.parse::<cookie::Cookie>() {
+            window.set_cookie(cookie).ok();
+        }
+    }
+    window.navigate(page_url).ok();
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Ok(title) = window.title() {
+            if let Some(token) = title.strip_prefix(TOKEN_PROBE_TITLE_PREFIX) {
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+                {
+                    let token = token.to_owned();
+                    if let Ok(mut guard) = token_state.token.lock() {
+                        *guard = Some((auth.uin.clone(), token.clone()));
+                    }
+                    window.close().ok();
+                    return Some(token);
+                }
+            }
+        }
+        if let Ok(guard) = token_state.token.lock() {
+            if let Some((uin, token)) = guard.as_ref() {
+                if uin == &auth.uin && !token.is_empty() {
+                    let result = token.clone();
+                    drop(guard);
+                    window.close().ok();
+                    return Some(result);
+                }
+            }
+        }
+    }
+    window.close().ok();
+    None
+}
+
+async fn fetch_qzone_token(
+    app: &tauri::AppHandle,
+    state: &QLoginState,
+    auth: &crate::qlogin::QzoneAuth,
+    token_state: &QzonePageTokenState,
+) -> Option<String> {
+    // Different desktop shells are enabled for different QQ accounts.  Probe
+    // only known same-origin entry paths and stop as soon as one exposes the
+    // page token.  No page body or token is logged or returned to the UI.
+    let candidates = [
+        format!("https://user.qzone.qq.com/{}", auth.uin),
+        format!("https://user.qzone.qq.com/{}/main", auth.uin),
+        format!("https://user.qzone.qq.com/{}/infocenter", auth.uin),
+    ];
+    let mut page_expression = None;
+    for home_url in candidates {
+        let Ok(mut response) = state
+            .client()
+            .get(&home_url)
+            .header(ACCEPT, "text/html,application/xhtml+xml")
+            .header(REFERER, "https://qzone.qq.com/")
+            .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
+            // Match an authenticated browser request.  The persisted session
+            // is already restricted to the small allow-list in qlogin.rs.
+            .header(COOKIE, &auth.cookie_header)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        // The shared client disables automatic redirects for login safety.
+        // Follow only HTTPS redirects that stay on user.qzone.qq.com.
+        for _ in 0..3 {
+            if !response.status().is_redirection() {
+                break;
+            }
+            let Some(location) = response.headers().get(LOCATION) else {
+                break;
+            };
+            let Some(next) = location.to_str().ok().and_then(|location| {
+                Url::parse(response.url().as_str())
+                    .ok()?
+                    .join(location)
+                    .ok()
+            }) else {
+                break;
+            };
+            if next.scheme() != "https" || next.host_str() != Some("user.qzone.qq.com") {
+                break;
+            }
+            let Ok(next_response) = state
+                .client()
+                .get(next)
+                .header(ACCEPT, "text/html,application/xhtml+xml")
+                .header(REFERER, &home_url)
+                .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
+                .header(COOKIE, &auth.cookie_header)
+                .send()
+                .await
+            else {
+                break;
+            };
+            response = next_response;
+        }
+        if response.status().is_success() {
+            if let Ok(page) = response.text().await {
+                if let Some(token) = extract_qzone_token(&page) {
+                    return Some(token);
+                }
+                if page_expression.is_none() {
+                    page_expression = extract_qzone_token_expression(&page);
+                }
+            }
+        }
+    }
+    fetch_qzone_token_from_webview(app, auth, token_state, page_expression.as_deref()).await
+}
 
 #[derive(Clone, Default)]
 pub struct RecycleAuthState {
     pwd2sig: Arc<Mutex<Option<String>>>,
 }
 
-#[cfg(windows)]
 fn pwd2sig_from_url(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     url.query_pairs().find_map(|(key, value)| {
@@ -181,6 +447,225 @@ fn ensure_qzone_success(value: Value) -> Result<Value, String> {
     Err(format!("QQ 空间接口返回错误 {code}：{message}"))
 }
 
+pub(crate) fn library_page_size(module: &str) -> usize {
+    match module {
+        "albums" => 3000,
+        "favorites" => 30,
+        "guestbook" | "videos" => 20,
+        _ => 100,
+    }
+}
+
+pub(crate) async fn fetch_library_page(
+    app: &tauri::AppHandle,
+    state: &QLoginState,
+    token_state: &QzonePageTokenState,
+    module: &str,
+    offset: usize,
+    parent_key: Option<&str>,
+) -> Result<Value, String> {
+    let auth = state.qzone_auth().await?;
+    // Several legacy Qzone endpoints reject oversized batches instead of
+    // clamping them. In particular, Favorites returns -4003 for num=100;
+    // QZoneExport's proven value is 30.
+    let page_size = library_page_size(module);
+    let mut common = vec![
+        ("uin", auth.uin.clone()),
+        ("hostUin", auth.uin.clone()),
+        ("inCharset", "utf-8".into()),
+        ("outCharset", "utf-8".into()),
+        ("format", "jsonp".into()),
+        ("g_tk", auth.g_tk.to_string()),
+    ];
+    let mut qzone_token = None;
+    if matches!(module, "guestbook" | "favorites") {
+        // The page token is optional on the current desktop proxy.  In
+        // particular, QzonePhoto's maintained Favorites implementation omits
+        // it entirely and authenticates with the session cookie plus g_tk.
+        // Sending an empty qzonetoken is not equivalent to omitting it: some
+        // Qzone deployments answer that request with a misleading empty list.
+        qzone_token = fetch_qzone_token(app, state, &auth, token_state).await;
+        if let Some(token) = qzone_token.as_ref().filter(|token| !token.is_empty()) {
+            common.push(("qzonetoken", token.clone()));
+        }
+    }
+    let (url, mut query) = match module {
+        "albums" => (
+            LIBRARY_ALBUMS_URL,
+            vec![
+                ("appid", "4".into()),
+                ("source", "qzone".into()),
+                ("plat", "qzone".into()),
+                ("notice", "0".into()),
+                ("filter", "1".into()),
+                ("handset", "4".into()),
+                ("needUserInfo", "1".into()),
+                ("mode", "2".into()),
+                ("sortOrder", "2".into()),
+                ("pageStart", offset.to_string()),
+                ("pageNum", page_size.to_string()),
+            ],
+        ),
+        "photos" => (
+            LIBRARY_PHOTOS_URL,
+            vec![
+                ("mode", "0".into()),
+                ("topicId", parent_key.unwrap_or_default().into()),
+                ("noTopic", "0".into()),
+                ("pageStart", offset.to_string()),
+                ("pageNum", page_size.to_string()),
+                ("skipCmtCount", "0".into()),
+                ("singleurl", "1".into()),
+                ("batchId", String::new()),
+                ("notice", "0".into()),
+                ("appid", "4".into()),
+                ("source", "qzone".into()),
+                ("plat", "qzone".into()),
+                ("outstyle", "json".into()),
+                ("json_esc", "1".into()),
+            ],
+        ),
+        "videos" => (
+            LIBRARY_VIDEOS_URL,
+            vec![
+                ("appid", "4".into()),
+                ("getMethod", "2".into()),
+                ("start", offset.to_string()),
+                ("count", page_size.to_string()),
+                ("need_old", "1".into()),
+                ("getUserInfo", "1".into()),
+                ("refer", "qzone".into()),
+                ("source", "qzone".into()),
+            ],
+        ),
+        "guestbook" => (
+            LIBRARY_GUESTBOOK_URL,
+            vec![
+                ("start", offset.to_string()),
+                ("num", page_size.to_string()),
+                ("s", format!("{}", now_millis())),
+            ],
+        ),
+        "favorites" => (
+            LIBRARY_FAVORITES_URL,
+            vec![
+                ("type", "0".into()),
+                ("start", offset.to_string()),
+                ("num", page_size.to_string()),
+                ("need_nick", "1".into()),
+                ("need_cnt", if offset == 0 { "1" } else { "0" }.into()),
+                ("need_new_user", if offset == 0 { "1" } else { "0" }.into()),
+                ("fupdate", "1".into()),
+                ("callback", "_Callback".into()),
+                ("random", format!("0.{}", now_millis())),
+            ],
+        ),
+        _ => return Err("不支持的归档模块".into()),
+    };
+    if module == "photos" && parent_key.is_none_or(str::is_empty) {
+        return Err("读取照片前需要先选择相册".into());
+    }
+    query.extend(common);
+    if module == "favorites" {
+        // Match the currently maintained QzonePhoto request contract.  The
+        // legacy Favorites CGI keys off `uin`; hostUin/format are unrelated
+        // feed parameters and can change its response shape on some accounts.
+        query.retain(|(key, _)| !matches!(*key, "hostUin" | "format"));
+    }
+    let referer = if module == "favorites" {
+        format!("https://user.qzone.qq.com/{}/myhome/favorite", auth.uin)
+    } else {
+        format!("https://user.qzone.qq.com/{}", auth.uin)
+    };
+    let response = state
+        .client()
+        .get(url)
+        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+        .header(REFERER, referer)
+        // These are desktop Qzone endpoints.  A mobile UA can select a
+        // different backend representation even with the same cookies.
+        .header(USER_AGENT, DESKTOP_QZONE_USER_AGENT)
+        .header(COOKIE, &auth.cookie_header)
+        .query(&query)
+        .send()
+        .await
+        .map_err(|error| format!("同步 QQ 空间资料失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 QQ 空间资料响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("同步 QQ 空间资料失败：HTTP {status}"));
+    }
+    let mut value = parse_qzone_json(&text)?;
+    let code = value
+        .get("code")
+        .and_then(|entry| entry.as_i64().or_else(|| entry.as_str()?.parse().ok()))
+        .unwrap_or(0);
+    if code != 0 {
+        let message = value
+            .get("message")
+            .or_else(|| value.get("msg"))
+            .and_then(Value::as_str)
+            .unwrap_or("未知错误");
+        return Err(format!("QQ 空间接口返回错误 {code}：{message}"));
+    }
+    if module == "favorites" {
+        // Keep only non-sensitive response metadata.  This lets the UI
+        // distinguish a genuinely empty favorite list from a token/parser
+        // mismatch without ever exposing cookies, qzonetoken or content.
+        let top_keys = value
+            .as_object()
+            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let data = value.get("data");
+        let data_keys = data
+            .and_then(Value::as_object)
+            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let declared_total = data
+            .map(|entry| {
+                entry
+                    .get("total_num")
+                    .or_else(|| entry.get("total"))
+                    .and_then(|entry| {
+                        entry
+                            .as_i64()
+                            .or_else(|| entry.as_str().and_then(|text| text.parse().ok()))
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let list_len = data
+            .and_then(|entry| entry.get("fav_list").or_else(|| entry.get("favorites")))
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "_qza_diagnostic".into(),
+                json!({
+                    "qzonetoken_present": qzone_token.is_some(),
+                    "request_contract": "desktop_cookie_g_tk",
+                    "top_keys": top_keys,
+                    "data_keys": data_keys,
+                    "declared_total": declared_total,
+                    "list_len": list_len,
+                }),
+            );
+        }
+    }
+    Ok(value)
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 async fn recycle_get(
     state: &QLoginState,
     url: &str,
@@ -248,20 +733,27 @@ pub async fn open_recycle_password_window(
         auth.uin
     ))
     .map_err(|error| format!("回收站地址无效：{error}"))?;
+    // Keep this bridge deliberately small. Recursively walking QQ's global
+    // objects and every iframe caused WebKit's authentication content process
+    // to terminate on macOS. We only observe request URLs/bodies here; the
+    // password field itself is never read.
     let bridge_script = r#"
       (() => {
+        if (window.__qzaPwdBridgeInstalled) return;
+        window.__qzaPwdBridgeInstalled = true;
         const prefix = '__QZA_PWD2SIG__';
         const publish = (token) => {
           if (typeof token !== 'string' || token.length < 5) return;
-          document.title = prefix + token;
-          try { history.replaceState(null, '', location.pathname + location.search + '#pwd2sig=' + encodeURIComponent(token)); } catch (_) {}
           try {
-            if (window.top && window.top !== window) {
-              window.top.document.title = prefix + token;
-              window.top.history.replaceState(null, '', window.top.location.pathname + window.top.location.search + '#pwd2sig=' + encodeURIComponent(token));
-            }
+            if (window.top === window) document.title = prefix + token;
+            else window.top.postMessage({ source: 'qza-recycle', pwd2sig: token }, '*');
           } catch (_) {}
         };
+        if (window.top === window) {
+          window.addEventListener('message', (event) => {
+            if (event?.data?.source === 'qza-recycle') publish(String(event.data.pwd2sig || ''));
+          });
+        }
         const capture = (input) => {
           try {
             if (input instanceof FormData || input instanceof URLSearchParams) {
@@ -283,88 +775,54 @@ pub async fn open_recycle_password_window(
           const originalFetch = window.fetch;
           window.fetch = function(input, init) { capture(input); capture(init?.body); return originalFetch.apply(this, arguments); };
         } catch (_) {}
-        const read = (w) => {
-          try {
-            const dc = w.QZONE && w.QZONE.dataCenter;
-            const token = dc && typeof dc.get === 'function' && dc.get('pwd2sig');
-            if (typeof token === 'string' && token.length > 4) return token;
-          } catch (_) {}
-          try {
-            const seen = new WeakSet();
-            const scan = (value, depth) => {
-              if (!value || depth > 4 || (typeof value !== 'object' && typeof value !== 'function')) return '';
-              if (seen.has(value)) return ''; seen.add(value);
-              for (const key of Object.keys(value)) {
-                let child; try { child = value[key]; } catch (_) { continue; }
-                if (key.toLowerCase().includes('pwd2sig') && typeof child === 'string' && child.length > 4) return child;
-                const found = scan(child, depth + 1); if (found) return found;
-              }
-              return '';
-            };
-            const found = scan(w.QZONE, 0) || scan(w.QPHOTO, 0);
-            if (found) return found;
-            for (const storage of [w.localStorage, w.sessionStorage]) {
-              for (let i = 0; i < storage.length; i++) {
-                const key = storage.key(i) || ''; const value = storage.getItem(key) || '';
-                if (key.toLowerCase().includes('pwd2sig') && value.length > 4) return value;
-              }
-            }
-          } catch (_) {}
-          try {
-            for (let i = 0; i < w.frames.length; i++) {
-              const token = read(w.frames[i]);
-              if (token) return token;
-            }
-          } catch (_) {}
-          return '';
-        };
-        const tick = () => {
-          const token = read(window.top || window);
-          if (token) publish(token);
-          try {
-            const roots = [document];
-            for (const frame of document.querySelectorAll('iframe')) {
-              if (frame.contentDocument) roots.push(frame.contentDocument);
-            }
-            for (const root of roots) {
-              for (const node of root.querySelectorAll('*')) {
-                if ((node.textContent || '').trim() === '回收站' && !sessionStorage.getItem('__qzaRecycleOpened')) {
-                  sessionStorage.setItem('__qzaRecycleOpened', '1');
-                  const clickable = node.closest('a,button,[role="button"]') || node;
-                  clickable.click();
-                  return;
-                }
-              }
-            }
-          } catch (_) {}
-        };
-        window.__qzaReadPwd2sig = tick;
-        setInterval(tick, 800);
-        setTimeout(tick, 200);
       })();
     "#;
-    let builder = WebviewWindowBuilder::new(
-        &app,
-        RECYCLE_WINDOW_LABEL,
-        WebviewUrl::External(Url::parse("about:blank").expect("about:blank 必须是有效 URL")),
-    )
-    .title("验证 QQ 空间独立密码")
-    .inner_size(960.0, 720.0);
+    let navigation_state = recycle_state.inner().clone();
+    let builder =
+        WebviewWindowBuilder::new(&app, RECYCLE_WINDOW_LABEL, WebviewUrl::External(page_url))
+            .title("验证 QQ 空间独立密码")
+            .inner_size(960.0, 720.0)
+            .on_navigation(move |url| {
+                if let Some(token) = pwd2sig_from_url(url.as_str()) {
+                    if let Ok(mut guard) = navigation_state.pwd2sig.lock() {
+                        *guard = Some(token);
+                    }
+                }
+                true
+            });
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.center();
-    let window = builder
-        .initialization_script(bridge_script)
+    let _window = builder
+        // WKWebView can terminate the QQ verification content process when a
+        // document-start script replaces fetch/XHR on this legacy page. On
+        // macOS we therefore rely on navigation URLs and the WebKit cookie
+        // store only. Windows keeps the request observer as its callback does
+        // not consistently expose pwd2sig in the final URL.
+        .initialization_script(if cfg!(target_os = "macos") {
+            ""
+        } else {
+            bridge_script
+        })
         .build()
         .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
     #[cfg(windows)]
-    install_recycle_request_listener(&window, recycle_state.inner().clone());
-    for entry in auth.cookie_header.split("; ") {
-        if let Ok(cookie) = format!("{entry}; Domain=.qq.com; Path=/").parse::<cookie::Cookie>() {
-            window.set_cookie(cookie).ok();
-        }
-    }
-    window.navigate(page_url).ok();
+    install_recycle_request_listener(&_window, recycle_state.inner().clone());
     Ok(())
+}
+
+#[tauri::command]
+pub async fn prepare_recycle_password_window(
+    state: tauri::State<'_, QLoginState>,
+    recycle_state: tauri::State<'_, RecycleAuthState>,
+) -> Result<String, String> {
+    let auth = state.qzone_auth().await?;
+    if let Ok(mut guard) = recycle_state.pwd2sig.lock() {
+        *guard = None;
+    }
+    Ok(format!(
+        "https://user.qzone.qq.com/{}/photo/recycle",
+        auth.uin
+    ))
 }
 
 #[tauri::command]
@@ -378,55 +836,8 @@ pub async fn check_recycle_password(
         }
     }
     let Some(window) = app.get_webview_window(RECYCLE_WINDOW_LABEL) else {
-        return Ok(None);
+        return Err("独立密码验证窗口已关闭，请重新验证".into());
     };
-    window.eval(r#"(() => {
-      const publishFromUrl = (url) => {
-        try {
-          const match = String(url || '').match(/(?:^|[?&])pwd2sig=([^&]+)/i);
-          if (!match) return false;
-          const token = decodeURIComponent(match[1].replace(/\+/g, ' '));
-          history.replaceState(null, '', location.pathname + location.search + '#pwd2sig=' + encodeURIComponent(token));
-          return true;
-        } catch (_) { return false; }
-      };
-      const scanResources = (w) => {
-        try {
-          for (const entry of w.performance.getEntriesByType('resource')) if (publishFromUrl(entry.name)) return true;
-          for (let i = 0; i < w.frames.length; i++) if (scanResources(w.frames[i])) return true;
-        } catch (_) {}
-        return false;
-      };
-      if (scanResources(window)) return;
-      const seen = new WeakSet();
-      const findToken = (value, depth = 0) => {
-        if (!value || depth > 5 || (typeof value !== 'object' && typeof value !== 'function')) return '';
-        if (seen.has(value)) return ''; seen.add(value);
-        for (const key of Object.keys(value)) {
-          let child; try { child = value[key]; } catch (_) { continue; }
-          if (key.toLowerCase().includes('pwd2sig') && typeof child === 'string' && child.length > 4) return child;
-          const found = findToken(child, depth + 1); if (found) return found;
-        }
-        return '';
-      };
-      let token = '';
-      try { token = window.QZONE?.dataCenter?.get?.('pwd2sig') || ''; } catch (_) {}
-      try { token = token || window.QPHOTO?.dataCenter?.get?.('pwd2sig') || ''; } catch (_) {}
-      token = token || findToken(window.QZONE) || findToken(window.QPHOTO);
-      try {
-        for (const storage of [window.localStorage, window.sessionStorage]) {
-          for (let i = 0; i < storage.length; i++) {
-            const key = storage.key(i) || ''; const value = storage.getItem(key) || '';
-            if (key.toLowerCase().includes('pwd2sig') && value.length > 4) token = value;
-          }
-        }
-      } catch (_) {}
-      if (token) {
-        document.title = '__QZA_PWD2SIG__' + token;
-        try { history.replaceState(null, '', location.pathname + location.search + '#pwd2sig=' + encodeURIComponent(token)); } catch (_) {}
-      }
-    })()"#).ok();
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     let title = window.title().unwrap_or_default();
     let current_url = window
         .url()
@@ -1036,16 +1447,72 @@ fn value_number(value: &Value, names: &[&str]) -> i64 {
         .unwrap_or(0)
 }
 
+fn usable_content_media_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let url = if value.starts_with("//") {
+        format!("https:{value}")
+    } else {
+        value.to_owned()
+    };
+    let lower = url.to_ascii_lowercase();
+    ((url.starts_with("http://") || url.starts_with("https://"))
+        && !lower.contains("qlogo")
+        && !lower.contains("headimg")
+        && !lower.contains("qzonestyle")
+        && !lower.contains("custompraise"))
+    .then_some(url)
+}
+
+fn push_media_url(urls: &mut Vec<String>, value: Option<String>) {
+    let Some(url) = value.and_then(|value| usable_content_media_url(&value)) else {
+        return;
+    };
+    if !urls.iter().any(|saved| saved == &url) {
+        urls.push(url);
+    }
+}
+
+fn urls_from_collection(value: Option<&Value>, urls: &mut Vec<String>) {
+    let values = match value {
+        Some(Value::Array(values)) => values.iter().collect::<Vec<_>>(),
+        Some(Value::Object(values)) => values.values().collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    for value in values {
+        push_media_url(
+            urls,
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value_text(value, &["url", "video_url", "actionurl"])),
+        );
+    }
+}
+
 fn normalized_moment_pictures(moment: &Value) -> Option<Value> {
     let pictures = moment.get("pic")?.as_array()?;
     let pictures = pictures
         .iter()
         .filter_map(|picture| {
-            let mut seen = std::collections::HashSet::new();
-            let urls = ["url3", "url2", "url1", "rawUrl", "origin_url", "smallurl"]
-                .iter()
-                .filter_map(|name| value_text(picture, &[*name]))
-                .filter(|url| seen.insert(url.clone()))
+            let mut urls = Vec::new();
+            for name in [
+                "rawUrl",
+                "origin_url",
+                "url3",
+                "url2",
+                "url1",
+                "url",
+                "smallurl",
+            ] {
+                push_media_url(&mut urls, value_text(picture, &[name]));
+            }
+            urls_from_collection(picture.get("photourl"), &mut urls);
+            urls_from_collection(picture.get("urls"), &mut urls);
+            let urls = urls
+                .into_iter()
                 .map(|url| json!({ "url": url }))
                 .collect::<Vec<_>>();
             (!urls.is_empty()).then(|| json!({ "photourl": urls }))
@@ -1058,19 +1525,39 @@ fn normalized_moment_video(moment: &Value) -> Option<Value> {
     let from_video_list = moment
         .get("video")
         .and_then(Value::as_array)
-        .and_then(|videos| videos.first());
-    let from_picture = moment
+        .into_iter()
+        .flatten();
+    let from_pictures = moment
         .get("pic")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find_map(|picture| picture.get("video_info"));
-    let video = from_video_list.or(from_picture)?;
-    let url = value_text(video, &["url3", "url2", "url", "video_url"])?;
-    let cover = value_text(video, &["url1", "cover", "cover_url"])
-        .or_else(|| from_video_list.and_then(|value| value_text(value, &["url1"])));
-    let mut result = json!({ "videourl": url });
-    if let Some(cover) = cover {
+        .filter_map(|picture| picture.get("video_info"));
+    let videos = from_video_list.chain(from_pictures).collect::<Vec<_>>();
+    let mut urls = Vec::new();
+    let mut cover = None;
+    for video in videos {
+        for name in [
+            "url3",
+            "url2",
+            "actionurl",
+            "playurl",
+            "video_url",
+            "url",
+            "download_url",
+        ] {
+            push_media_url(&mut urls, value_text(video, &[name]));
+        }
+        urls_from_collection(video.get("videourls"), &mut urls);
+        urls_from_collection(video.get("urls"), &mut urls);
+        cover = cover.or_else(|| value_text(video, &["url1", "cover", "cover_url"]));
+    }
+    let first = urls.first()?.clone();
+    let mut result = json!({
+        "videourl": first,
+        "videourls": urls.into_iter().map(|url| json!({ "url": url })).collect::<Vec<_>>(),
+    });
+    if let Some(cover) = cover.and_then(|cover| usable_content_media_url(&cover)) {
         result["coverurl"] = json!([{ "url": cover }]);
     }
     Some(result)
@@ -1386,7 +1873,7 @@ fn history_date_to_timestamp(
     days * 86_400 + i64::from(hour * 3_600 + minute * 60 + second) - 8 * 3_600
 }
 
-fn parse_history_timestamp(value: &str) -> i64 {
+pub(crate) fn parse_history_timestamp(value: &str) -> i64 {
     for name in ["data-time", "data-timestamp", "data-abstime"] {
         let pattern = format!(r#"{name}=[\"'](\d{{9,13}})[\"']"#);
         if let Some(raw) = regex::Regex::new(&pattern)
@@ -1627,6 +2114,43 @@ fn history_mood_cell_id(card_body: &str, owner_uin: &str) -> Option<String> {
     })
 }
 
+fn little_endian_hex_u32(encoded: &[u8]) -> Option<u32> {
+    let encoded = encoded.get(..8)?;
+    let mut bytes = [0_u8; 4];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let high = (encoded[index * 2] as char).to_digit(16)? as u8;
+        let low = (encoded[index * 2 + 1] as char).to_digit(16)? as u8;
+        *byte = high << 4 | low;
+    }
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// QQ mood ids start with the owner UIN and original publish time, both as
+/// little-endian u32 values. Legacy notification cards expose only the later
+/// interaction time in their HTML, so decoding the canonical mood id is the
+/// only surviving authoritative timestamp for many deleted posts.
+pub(crate) fn mood_cell_id_published_at(
+    cell_id: &str,
+    owner_uin: &str,
+    event_time: i64,
+) -> Option<i64> {
+    if cell_id.len() < 16 {
+        return None;
+    }
+    let encoded = cell_id.as_bytes();
+    let encoded_owner = little_endian_hex_u32(encoded.get(..8)?)?;
+    let owner = owner_uin.parse::<u32>().ok()?;
+    if encoded_owner != owner {
+        return None;
+    }
+    let published_at = i64::from(little_endian_hex_u32(encoded.get(8..16)?)?);
+    const QZONE_LAUNCH: i64 = 1_104_537_600; // 2005-01-01 UTC
+    if published_at < QZONE_LAUNCH || (event_time > 0 && published_at > event_time) {
+        return None;
+    }
+    Some(published_at)
+}
+
 fn history_original_content(content: &str, owner_name: Option<&str>) -> Option<String> {
     let mut content = content.trim().to_owned();
     let owner_name = owner_name.map(str::trim).filter(|name| !name.is_empty())?;
@@ -1652,6 +2176,19 @@ fn history_original_content(content: &str, owner_name: Option<&str>) -> Option<S
         }
     }
     (!content.is_empty()).then_some(content)
+}
+
+fn history_guestbook_content(content: &str) -> String {
+    content
+        .trim()
+        .strip_prefix("留言")
+        .unwrap_or(content.trim())
+        .trim_start_matches(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ':' | '：' | '，' | ',' | '。' | '·' | '-')
+        })
+        .trim()
+        .to_owned()
 }
 
 fn history_html_as_feeds(
@@ -1689,6 +2226,7 @@ fn history_html_as_feeds(
             // neither a like (217) nor a comment (311). Preserve their original
             // family number instead of silently dropping the whole post.
             let event_type = if family == 311 { 2 } else { family };
+            let is_guestbook = event_type == 334;
             let people = history_elements(card_body, "a", "q_namecard")
                 .into_iter()
                 .filter_map(|(attrs, body)| {
@@ -1722,6 +2260,7 @@ fn history_html_as_feeds(
                 .unwrap_or_else(|| actor_uin.clone());
             let (_, content_markup) = history_element(card_body, "p", "txt-box-title")?;
             let content = history_original_content(&history_plain_text(&content_markup), owner_name)?;
+            let guestbook_content = is_guestbook.then(|| history_guestbook_content(&content));
             let time_node = history_element(card_body, "div", "info-detail");
             let time_text = time_node
                 .as_ref()
@@ -1739,12 +2278,24 @@ fn history_html_as_feeds(
                 .map(|url| json!({ "photourl": [{ "url": url }] }))
                 .collect::<Vec<_>>();
             let joined_media = media_urls.join("\n");
-            let cell_id = history_mood_cell_id(card_body, owner_uin).unwrap_or_else(|| {
-                format!(
-                    "history-v2:{:016x}",
-                    history_record_hash(&[owner_uin, &content, &joined_media])
-                )
-            });
+            let cell_id = if is_guestbook {
+                format!("history-guestbook:{stable_id}")
+            } else {
+                history_mood_cell_id(card_body, owner_uin).unwrap_or_else(|| {
+                    format!(
+                        "history-v2:{:016x}",
+                        history_record_hash(&[owner_uin, &content, &joined_media])
+                    )
+                })
+            };
+            // The legacy card's visible time is when the interaction happened,
+            // not when the original mood was published. Never invent a publish
+            // time when the canonical mood id is absent or fails validation.
+            let published_at = if is_guestbook {
+                event_time
+            } else {
+                mood_cell_id_published_at(&cell_id, owner_uin, event_time).unwrap_or(0)
+            };
             let target_name = people
                 .iter()
                 .find(|(uin, _)| uin != &actor_uin && uin != owner_uin)
@@ -1754,6 +2305,7 @@ fn history_html_as_feeds(
                 .flatten();
             let event_summary = match event_type {
                 217 => "点赞了这条说说".to_owned(),
+                334 => guestbook_content.clone().unwrap_or_default(),
                 2 if comment_content.is_some() => comment_content.clone().unwrap_or_default(),
                 2 if subtype == 14 || subtype == 35 => target_name
                     .map(|name| format!("回复了 {name}（旧历史接口未保留回复正文）"))
@@ -1783,16 +2335,15 @@ fn history_html_as_feeds(
                 "original": {
                     "cell_id": { "cellid": cell_id },
                     "cell_comm": {
-                        "appid": 311,
-                        // Deleted moods no longer expose their authoritative
-                        // publish time. The oldest surviving interaction time
-                        // is still a useful lower-fidelity fallback and matches
-                        // the recovery timestamp used by GetQzonehistory.
-                        "time": event_time,
+                        "appid": if is_guestbook { 334 } else { 311 },
+                        "time": published_at,
                         "feedskey": format!("history-v2-original:{:016x}", history_record_hash(&[owner_uin, &content, &joined_media])),
                     },
-                    "cell_userinfo": { "user": { "uin": owner_uin, "nickname": owner_name } },
-                    "cell_summary": { "summary": content },
+                    "cell_userinfo": { "user": {
+                        "uin": if is_guestbook { actor_uin.as_str() } else { owner_uin },
+                        "nickname": if is_guestbook { Some(actor_name.as_str()) } else { owner_name }
+                    } },
+                    "cell_summary": { "summary": guestbook_content.unwrap_or(content) },
                     "cell_pic": { "picdata": { "pic": pictures } },
                     "cell_comment": comments,
                 },
@@ -2264,12 +2815,52 @@ pub async fn fetch_more_feeds(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_history_html, ensure_qzone_success, feed_error_can_skip, feed_error_is_transient,
-        history_html_as_feeds, parse_feed_page, parse_portrait_names, parse_qzone_json,
-        retryable_response_reason, visible_moment_as_feeds, FEEDS_URL,
+        decode_history_html, ensure_qzone_success, extract_qzone_token,
+        extract_qzone_token_expression, feed_error_can_skip, feed_error_is_transient,
+        history_html_as_feeds, library_page_size, mood_cell_id_published_at, parse_feed_page,
+        parse_portrait_names, parse_qzone_json, retryable_response_reason, visible_moment_as_feeds,
+        FEEDS_URL,
     };
     use reqwest::StatusCode;
     use serde_json::json;
+
+    #[test]
+    fn uses_endpoint_safe_library_page_sizes() {
+        assert_eq!(library_page_size("favorites"), 30);
+        assert_eq!(library_page_size("guestbook"), 20);
+        assert_eq!(library_page_size("videos"), 20);
+        assert_eq!(library_page_size("photos"), 100);
+        assert_eq!(library_page_size("albums"), 3000);
+    }
+
+    #[test]
+    fn extracts_authenticated_page_token_without_exposing_other_script_values() {
+        let html = r#"
+          <script>window.unrelated = "do-not-use";</script>
+          <script>
+            window.g_qzonetoken = (function(){ try { return "abc_123-token"; }
+            catch(e){ return ""; } })();
+          </script>
+        "#;
+        assert_eq!(extract_qzone_token(html).as_deref(), Some("abc_123-token"));
+        assert!(extract_qzone_token("<script>window.unrelated='x'</script>").is_none());
+    }
+
+    #[test]
+    fn extracts_obfuscated_page_token_expression_for_isolated_webview_evaluation() {
+        let html = r#"
+          <script>
+            window.g_qzonetoken = (function(){ try {
+              return (+[]+[])+(!+[]+!![]+[]);
+            } catch(e) { return ""; } })();
+          </script>
+        "#;
+        assert_eq!(
+            extract_qzone_token_expression(html).as_deref(),
+            Some("(+[]+[])+(!+[]+!![]+[])")
+        );
+        assert!(extract_qzone_token_expression("<script>window.unrelated='x'</script>").is_none());
+    }
 
     #[test]
     fn keeps_first_page_feeds_and_cursor() {
@@ -2406,15 +2997,101 @@ mod tests {
     }
 
     #[test]
+    fn keeps_multiple_picture_and_video_quality_candidates_without_avatars() {
+        let feeds = visible_moment_as_feeds(
+            &json!({
+                "tid": "moment-media",
+                "uin": "10001",
+                "name": "本人",
+                "content": "媒体说说",
+                "created_time": 100,
+                "pic": [{
+                    "rawUrl": "https://example.com/original.jpg",
+                    "url1": "https://example.com/preview.jpg",
+                    "smallurl": "https://example.com/small.jpg",
+                    "photourl": [{"url": "https://example.com/fallback.jpg"}],
+                    "video_info": {
+                        "url3": "https://example.com/high.mp4",
+                        "url2": "https://example.com/low.mp4",
+                        "cover_url": "https://example.com/cover.jpg"
+                    }
+                }, {
+                    "url1": "https://qlogo2.store.qq.com/qzone/2/2/100"
+                }],
+                "video": [{
+                    "actionurl": "https://example.com/action.mp4",
+                    "videourls": [{"url": "https://example.com/mobile.mp4"}]
+                }]
+            }),
+            "10001",
+            0,
+        );
+        let original = &feeds[0]["original"];
+        let photo_urls = original["cell_pic"]["picdata"]["pic"][0]["photourl"]
+            .as_array()
+            .expect("应保存图片候选地址");
+        assert_eq!(photo_urls.len(), 4);
+        assert_eq!(
+            original["cell_pic"]["picdata"]["pic"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let video_urls = original["cell_video"]["videourls"]
+            .as_array()
+            .expect("应保存视频候选地址");
+        assert_eq!(video_urls.len(), 4);
+        assert_eq!(
+            original["cell_video"]["coverurl"][0]["url"],
+            "https://example.com/cover.jpg"
+        );
+    }
+
+    #[test]
+    fn decodes_original_publish_time_from_legacy_mood_id() {
+        let cell_id = "b327e672e295585b4ceb0500";
+        assert_eq!(
+            mood_cell_id_published_at(cell_id, "1927686067", 1_574_686_344),
+            Some(1_532_532_194)
+        );
+        assert_eq!(
+            mood_cell_id_published_at(cell_id, "1927686068", 1_574_686_344),
+            None
+        );
+
+        let response = format!(
+            r#"_Callback({{html:'\x3Cli class="f-single f-s-s" data-key="fct_2789306771_217_3_1574686344_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_2789306771"\x3E琪\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/1927686067/mood/{cell_id}"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1574686344"\x3E2019年11月25日 20:52\x3C/div\x3E\x3Cp class="txt-box-title"\x3E小苏：生活如果不宠你\x3C/p\x3E\x3C/li\x3E',opuin:'1927686067'}});"#
+        );
+        let html = decode_history_html(&response).expect("应解码旧历史消息 HTML");
+        let (_, feeds) = history_html_as_feeds(&html, "1927686067", Some("小苏"), 0);
+        assert_eq!(feeds[0]["comm"]["time"], 1_574_686_344_i64);
+        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 1_532_532_194_i64);
+    }
+
+    #[test]
     fn classifies_history_notifications_and_filters_decorative_media() {
-        let response = r#"_Callback({html:'\x3Cli class="f-single f-s-s" data-key="fct_20001_217_3_1627745220_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_20001"\x3E好友甲\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745220"\x3E2021年7月31日 23:27\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：\t\t一条历史说说\x3C/p\x3E\x3Cimg src="//qlogo2.store.qq.com/qzone/20001/20001/50"\x3E\x3Ca class="img-item"\x3E\x3Cimg src="//a1.qpic.cn/old.jpg"\x3E\x3C/a\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_30001_311_14_1627745320_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_99999"\x3E好友乙\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745320"\x3E2021年7月31日 23:28\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：一条历史说说\x3C/p\x3E\x3Cdiv class="comments-content"\x3E好友乙：这是评论正文\x3C/div\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_40001_333_15_1627745420_1_1"\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：系统通知\x3C/p\x3E\x3C/li\x3E',opuin:'10001'});"#;
+        let response = r#"_Callback({html:'\x3Cli class="f-single f-s-s" data-key="fct_20001_217_3_1627745220_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_20001"\x3E好友甲\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745220"\x3E2021年7月31日 23:27\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：\t\t一条历史说说\x3C/p\x3E\x3Cimg src="//qlogo2.store.qq.com/qzone/20001/20001/50"\x3E\x3Ca class="img-item"\x3E\x3Cimg src="//a1.qpic.cn/old.jpg"\x3E\x3C/a\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_30001_311_14_1627745320_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_99999"\x3E好友乙\x3C/a\x3E\x3Ca href="//user.qzone.qq.com/10001/mood/moment-1"\x3E查看说说\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1627745320"\x3E2021年7月31日 23:28\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：一条历史说说\x3C/p\x3E\x3Cdiv class="comments-content"\x3E好友乙：这是评论正文\x3C/div\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_40001_333_15_1627745420_1_1"\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：系统通知\x3C/p\x3E\x3C/li\x3E\x3Cli class="f-single f-s-s" data-key="fct_50001_334_1_1585007595_1_1"\x3E\x3Ca class="f-name q_namecard" link="nameCard_50001"\x3E留言好友\x3C/a\x3E\x3Cdiv class="info-detail" data-time="1585007595"\x3E2020年3月24日 08:33\x3C/div\x3E\x3Cp class="txt-box-title ellipsis-one"\x3E本人：留言：愿你快乐\x3C/p\x3E\x3C/li\x3E',opuin:'10001'});"#;
         let html = decode_history_html(response).expect("应解码旧历史消息 HTML");
         let (scanned, feeds) = history_html_as_feeds(&html, "10001", Some("本人"), 0);
-        assert_eq!(scanned, 3);
-        assert_eq!(feeds.len(), 3);
+        assert_eq!(scanned, 4);
+        assert_eq!(feeds.len(), 4);
         assert_eq!(feeds[0]["comm"]["subid"], 217);
         assert_eq!(feeds[1]["comm"]["subid"], 2);
         assert_eq!(feeds[2]["comm"]["subid"], 333);
+        assert_eq!(feeds[3]["comm"]["subid"], 334);
+        assert_eq!(feeds[3]["original"]["cell_comm"]["appid"], 334);
+        assert_eq!(feeds[3]["original"]["cell_comm"]["time"], 1_585_007_595_i64);
+        assert_eq!(
+            feeds[3]["original"]["cell_userinfo"]["user"]["uin"],
+            "50001"
+        );
+        assert_eq!(feeds[3]["original"]["cell_summary"]["summary"], "愿你快乐");
+        assert_eq!(feeds[3]["summary"]["summary"], "愿你快乐");
+        assert!(feeds[3]["original"]["cell_id"]["cellid"]
+            .as_str()
+            .unwrap()
+            .starts_with("history-guestbook:"));
         assert_eq!(feeds[2]["original"]["cell_summary"]["summary"], "系统通知");
         assert_eq!(feeds[0]["userinfo"]["user"]["uin"], "20001");
         assert_eq!(feeds[1]["userinfo"]["user"]["uin"], "30001");
@@ -2446,7 +3123,7 @@ mod tests {
             1
         );
         assert_eq!(feeds[0]["comm"]["time"], 1_627_745_220);
-        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 1_627_745_220);
+        assert_eq!(feeds[0]["original"]["cell_comm"]["time"], 0);
         assert!(!feeds[0]["original"]["cell_summary"]["summary"]
             .as_str()
             .unwrap()

@@ -13,6 +13,7 @@ pub fn run() {
         .manage(archive::ArchiveState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
+        .manage(qzone::QzonePageTokenState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
@@ -30,6 +31,7 @@ pub fn run() {
             qzone::fetch_first_feeds,
             qzone::fetch_more_feeds,
             qzone::open_recycle_password_window,
+            qzone::prepare_recycle_password_window,
             qzone::check_recycle_password,
             qzone::close_recycle_password_window,
             qzone::list_recycle_albums,
@@ -55,6 +57,9 @@ pub fn run() {
             archive::get_archive_overview,
             archive::list_interactors,
             archive::list_contact_comment_threads,
+            archive::sync_qzone_library,
+            archive::list_qzone_library,
+            archive::list_qzone_library_years,
             archive::get_interaction_ranking,
             archive::delete_archived_feeds,
             archive::clear_archived_feeds,

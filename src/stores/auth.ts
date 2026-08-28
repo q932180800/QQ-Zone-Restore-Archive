@@ -32,10 +32,13 @@ export const useAuthStore = defineStore("auth", () => {
   const credentials = ref<LoginCredentials>();
   const webLoginMode = ref(false);
   let pollingRun = 0;
+  let restoringSession = false;
 
   const loggedIn = computed(() => status.value === "success" && Boolean(user.value));
 
   async function restoreSession() {
+    if (restoringSession || loggedIn.value) return;
+    restoringSession = true;
     try {
       const result = await invoke<LoginStatus>("get_login_status");
       status.value = result.status;
@@ -43,9 +46,12 @@ export const useAuthStore = defineStore("auth", () => {
       if (result.status === "success" && result.auth) {
         credentials.value = result.auth;
         user.value = await getQzoneLoginUser(result.auth);
+        syncCookiesToWebview().catch(() => {});
       }
     } catch {
       status.value = "loggedOut";
+    } finally {
+      restoringSession = false;
     }
   }
 
