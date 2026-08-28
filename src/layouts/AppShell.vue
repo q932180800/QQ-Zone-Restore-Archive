@@ -18,24 +18,35 @@ const route = useRoute();
 const accountPopover = ref<InstanceType<typeof Popover>>();
 const moreVisible = ref(false);
 const logoutLoading = ref(false);
-const { darkMode, sidebarCollapsed, themeIcon } = storeToRefs(appStore);
+const { darkMode, themeIcon } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
 const showQzoneButton = computed(() => {
   const currentPlatform = platform();
   return currentPlatform !== "android" && currentPlatform !== "ios";
 });
-const navigation = [
-  { label: "概览", icon: "pi pi-home", to: "/" },
-  { label: "归档", icon: "pi pi-inbox", to: "/archives" },
-  { label: "联系人", icon: "pi pi-users", to: "/contacts" },
-  { label: "媒体", icon: "pi pi-images", to: "/media" },
-  { label: "任务", icon: "pi pi-sync", to: "/tasks" },
-  { label: "回收站", icon: "pi pi-trash", to: "/recycle-bin" },
-  { label: "设置", icon: "pi pi-cog", to: "/settings" },
+const navigationGroups = [
+  { label: "归档工作台", items: [
+    { label: "概览", icon: "pi pi-home", to: "/" },
+    { label: "说说归档", icon: "pi pi-comments", to: "/archives" },
+    { label: "归档任务", icon: "pi pi-sync", to: "/tasks" },
+  ] },
+  { label: "空间资料", items: [
+    { label: "相册", icon: "pi pi-images", to: "/albums" },
+    { label: "视频", icon: "pi pi-video", to: "/videos" },
+    { label: "留言板", icon: "pi pi-envelope", to: "/guestbook" },
+    { label: "收藏", icon: "pi pi-bookmark", to: "/favorites" },
+    { label: "说说媒体", icon: "pi pi-camera", to: "/media" },
+    { label: "联系人", icon: "pi pi-users", to: "/contacts" },
+  ] },
+  { label: "工具与设置", items: [
+    { label: "相册回收站", icon: "pi pi-trash", to: "/recycle-bin" },
+    { label: "设置", icon: "pi pi-cog", to: "/settings" },
+  ] },
 ];
-const mobileNavigation = [navigation[0], navigation[1], navigation[3], navigation[4]];
-const mobileMoreNavigation = [navigation[2], navigation[6]];
-const moreActive = computed(() => mobileMoreNavigation.some((item) => item.to === route.path));
+const navigation = navigationGroups.flatMap((group) => group.items);
+const mobileNavigation = [navigation[0], navigation[1], navigation[3], navigation[2]];
+const mobileMoreNavigation = navigation.filter((item) => !mobileNavigation.includes(item));
+const moreActive = computed(() => mobileMoreNavigation.some((item) => route.path === item.to || route.path.startsWith(`${item.to}/`)));
 function qzoneUrl() {
   const uin = user.value?.uin;
   if (platform() === "android") return uin ? `https://m.qzone.qq.com/${uin}` : "https://m.qzone.qq.com";
@@ -71,24 +82,27 @@ async function logout() {
 </script>
 
 <template>
-  <div class="app-shell" :class="{ 'app-dark': darkMode, 'sidebar-collapsed': sidebarCollapsed }">
+  <div class="app-shell" :class="{ 'app-dark': darkMode }">
     <aside class="desktop-sidebar">
       <div class="brand">
-        <div class="brand-mark"><i class="pi pi-box" /></div>
-        <div class="brand-copy"><strong>恢复归档</strong><span>QQ Zone Restore Archive</span></div>
+        <div class="brand-mark" aria-hidden="true">QZ</div>
+        <div class="brand-copy"><strong>空间记忆库</strong><span>PRIVATE QZONE ARCHIVE</span></div>
       </div>
       <nav class="side-navigation" aria-label="主要导航">
-        <RouterLink v-for="item in navigation" :key="item.to" :to="item.to">
-          <i :class="item.icon" /><span>{{ item.label }}</span>
-        </RouterLink>
+        <section v-for="group in navigationGroups" :key="group.label" class="navigation-group">
+          <p>{{ group.label }}</p>
+          <RouterLink v-for="item in group.items" :key="item.to" :to="item.to">
+            <i :class="item.icon" /><span>{{ item.label }}</span>
+          </RouterLink>
+        </section>
       </nav>
       <div class="sidebar-footer">
-        <Button :icon="sidebarCollapsed ? 'pi pi-angle-right' : 'pi pi-angle-left'" severity="secondary" text rounded aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
+        <span class="privacy-dot" aria-hidden="true" /><span><strong>本地优先</strong><small>资料仅保存在这台设备</small></span>
       </div>
     </aside>
     <div class="app-workspace">
       <header class="topbar">
-        <div><p class="topbar-eyebrow">QQ ZONE RESTORE ARCHIVE</p><h1>{{ pageTitle }}</h1></div>
+        <div><p class="topbar-eyebrow">MY QZONE MEMORY</p><h1>{{ pageTitle }}</h1></div>
         <div class="topbar-actions">
           <Button :icon="themeIcon" severity="secondary" text rounded aria-label="切换主题" @click="appStore.toggleTheme" />
           <button class="account-chip" type="button" :aria-label="loggedIn ? '打开账号菜单' : '登录 QQ 空间'" @click="handleAccountClick">

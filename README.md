@@ -17,81 +17,51 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 项目地址：[xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive)
 
 > [!IMPORTANT]
-> 本项目是基于 [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) 的 GPLv3 二次开发版本，并参考了 [LibraHp/GetQzonehistory](https://github.com/LibraHp/GetQzonehistory)、[salt-fishes/qzone-archiver](https://github.com/salt-fishes/qzone-archiver) 与 [Gu-Heping/onebot-qzone](https://github.com/Gu-Heping/onebot-qzone) 的历史通知、评论正文和昵称解析思路。原项目作者、参考项目作者和腾讯公司均不对本分支提供背书或担保。
+> 本项目是基于 [Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive) 的 GPLv3 二次开发版本，并参考了 [LibraHp/GetQzonehistory](https://github.com/LibraHp/GetQzonehistory)、[ShunCai/QZoneExport](https://github.com/ShunCai/QZoneExport)、[salt-fishes/qzone-archiver](https://github.com/salt-fishes/qzone-archiver)、[11273/QzonePhoto](https://github.com/11273/QzonePhoto) 与 [Gu-Heping/onebot-qzone](https://github.com/Gu-Heping/onebot-qzone) 的历史取数、空间资料接口、评论正文和昵称解析思路。QZoneExport 参考实现遵循 Apache-2.0；详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。原项目作者、参考项目作者和腾讯公司均不对本分支提供背书或担保。
 
 > [!WARNING]
 > 本项目不是腾讯、QQ 或 QQ 空间官方产品。所谓“恢复已删除说说”仅指：当已删除内容仍残留在点赞、评论、回复等互动记录中时，尝试还原其中可取得的正文和媒体信息；没有互动痕迹、已被服务端彻底清除、无权访问或接口不再返回的内容无法恢复，也不保证归档结果完整。请仅处理本人账号或已获得充分授权的内容，并自行承担账号限制、第三方接口变化、数据遗漏和本地数据保管风险。
 
-如果本项目对你有帮助，也请支持并 Star [上游项目 Gaoshu705/QzoneArchive](https://github.com/Gaoshu705/QzoneArchive)。
+如果本项目对你有帮助，可以支持并 Star [xiaosu19/QQ-Zone-Restore-Archive](https://github.com/xiaosu19/QQ-Zone-Restore-Archive)。
 
 ## 功能
 
-- **完整归档**：还原原始动态正文、图片、视频和评论，按「本人动态」「好友动态」「留言」分类整理
-- **断点续传**：中断后自动从上次位置继续，已归档的内容不会丢失
-- **频率保护**：每 10 分钟最多请求 300 页，触发限流后安全暂停，倒计时结束即可继续
-- **互动还原**：查看每条动态的点赞用户和评论回复，支持互动排行榜
-- **本地存储**：所有数据以 SQLite 保存在本地应用数据目录，不上传任何服务器
-- **HTML 导出**：支持按分类或选中导出为独立 HTML 文件，可离线浏览
-- **媒体时光轴**：按年份浏览归档的照片和视频，视频支持按需缓存
-- **暗色模式**：跟随系统或手动切换
-- **跨平台**：Windows / macOS / Linux 桌面端 + Android 移动端
+- **多来源恢复**：合并当前可见说说、旧历史消息残留和移动端互动通知，尽量找回仍被 QQ 接口保留的本人说说、好友动态与留言线索
+- **结构化互动**：还原点赞用户、评论、回复人与被回复人，补全可取得的昵称，并提供联系人排行和评论往来视图
+- **深度扫描与续传**：顺序探测历史记录，在最后命中后继续验证空尾；被限流或中断时保留断点和已经写入的数据
+- **资料独立归档**：相册、相册照片、独立视频、留言板与 QQ 空间网页端旧收藏分别分页同步，不与说说混在一起
+- **媒体整理**：按年份浏览说说照片和视频，保留多个可用清晰度候选，过滤头像、点赞图标和空间装饰资源
+- **本地优先**：SQLite 数据库、媒体缓存和导出文件都保存在用户设备；登录会话只进入操作系统安全凭据库
+- **检索与导出**：支持全文搜索、年份筛选、时间排序、批量管理与离线 HTML 导出
+- **桌面体验**：面向大数据量重新设计紧凑双列卡片、资料导航、暗色模式和窄屏布局
+- **跨平台发行**：提供 Windows、macOS（Intel / Apple 芯片）、Linux、Android、iOS 未签名包与 NixOS 构建
 
-## v1.0.9 优化
+完整版本历史请查看 [CHANGELOG.md](CHANGELOG.md)。
 
-- 归档内容新增年份筛选与时间正序/倒序排列，概览中的“最近动态”默认展示最新记录
-- 联系人评论数支持点击查看按原说说归组的完整评论往来；评论者和回复者昵称悬停可查看 QQ 号
-- 历史消息改为参考 `GetQzonehistory` 的边界定位再完整回扫，探测上限为 offset 10,000,000，并在任务结果中显示估算边界与最深探测位置
-- 继续保留数据库稳定键去重、评论回复链合并、昵称补全及媒体过滤；无法从旧接口恢复的正文会明确标记，不伪造内容
+## 界面预览
 
-## v1.0.8 优化
+![本地归档概览与互动排行榜](public/runtime/仪表盘.png)
 
-- 历史互动卡片新增评论正文解析，不再把仍存在于 `.comments-content` / `.comments-item` 中的原文替换为占位提示
-- 修正历史卡片操作者昵称的匹配规则，并通过 QQ 空间 GBK 昵称接口批量补全仅有 QQ 号的点赞者、评论者和联系人
-- 历史分页遇到偶发空响应时连续向后验证三页，避免单次空页导致归档提前结束；已有归档仍按稳定键去重合并
-- 评论展示优先使用补全后的联系人昵称，概览、联系人排行、点赞和评论统计继续直接从 SQLite 最新数据计算
+| 归档内容 | 说说媒体 |
+|---|---|
+| ![归档内容](public/runtime/归档内容.png) | ![说说媒体](public/runtime/媒体时光轴.png) |
 
-## v1.0.7 优化
+| 联系人与互动统计 | 按联系人查看评论往来 |
+|---|---|
+| ![联系人与互动统计](public/runtime/联系人.png) | ![联系人评论往来](public/runtime/联系人评论.png) |
 
-- 重写旧历史消息解析：只将说说主体保存为动态，点赞、评论与回复作为互动合并到对应说说，过滤系统通知、主页卡片等非说说记录
-- 媒体只读取历史卡片中的正文附件，排除联系人头像、点赞图标、QQ 空间装饰资源，并清理正文中的转义制表符
-- 启动时自动移除 v1.0.6 错误解析产生的 `history-html` 污染记录；重新归档后联系人排行、点赞、评论与媒体统计会按修正后的数据重建
-- 概览页新增“刷新数据”，归档执行期间自动同步进度与统计，任务结束时自动完成最后一次刷新
-- 对旧接口未返回的评论或回复正文明确标注为“未保留”，不再把说说正文冒充评论内容
+## 下载与安装
 
-## v1.0.6 优化
+请从本仓库的 [Releases](https://github.com/xiaosu19/QQ-Zone-Restore-Archive/releases) 下载与系统匹配的安装包：
 
-- 按 `GetQzonehistory` 的完整双通道方案接入旧版 `feeds2_html_pav_all` 历史消息列表，与仍存在的本人说说去重合并
-- 修正 `emotion_cgi_msglist_v6` 的分页规则：固定每页 30 条并按请求页长推进，不再因首批只返回少量记录而错位结束
-- 可见说说接口改用与参考项目一致的桌面 Chromium 请求头及精简 Cookie 顺序，避免移动端登录指纹影响旧接口结果
-- 归档进度同时报告“接口总数 / 实际同步数 / 历史残留数”；接口提前返回空页时明确报错，不再误报完整成功
-- 新增 Rust 自动测试任务，持续验证历史 HTML 解析以及评论、递归回复链转换
+- Windows：NSIS 安装程序（`.exe`）
+- macOS：Intel `x64` 或 Apple 芯片 `aarch64` 安装镜像（`.dmg`）
+- Linux：AppImage、Debian/Ubuntu `deb`、Fedora/openSUSE `rpm`
+- Android：通用 `apk`
+- iOS：未签名 `ipa`，需要自行签名后安装
+- NixOS：包含 Nix closure 的离线安装包
 
-## v1.0.5 优化
-
-- 新增本人历史说说补齐通道，参考 `GetQzonehistory` 使用 `emotion_cgi_msglist_v6` 分页读取可见说说
-- 将 `commentlist` 与递归 `list_3` 回复链转换为“谁评论、谁回复谁”的结构化互动记录
-- 原互动通知接口发生 HTTP 500 时，仍保留已取得的本人说说与评论，不再显示为 0 条或整次归档失败
-- 合并两套接口的重复点赞、评论和回复，互动数量以去重后的实际展示内容为准
-
-## v1.0.4 优化
-
-- 媒体时光轴改为稳定的响应式网格，图片异步加载时不再产生大面积空洞
-- 卡片悬停和键盘聚焦时保持明确的文字对比度，并支持“减少动态效果”系统设置
-- 连续 HTTP 500、429、超时或系统繁忙会保留断点并安全暂停，不再误判为坏页后大跨度跳过记录
-- 只有明确的单页接口错误才会尝试自动定位，最大探测范围由 4096 收紧到 256；无效 JSON 或缺少数据也会安全暂停，降低无声漏档风险
-- 降低任务页轮询频率，并升级存在已知安全问题的间接前端依赖
-
-参考项目 `GetQzonehistory` 的旧接口返回的是信息较少的 HTML。本项目从 v1.0.6 起直接将其作为“历史消息残留”来源之一，但仍会与结构化的可见说说、评论回复和互动通知合并；该历史列表本身不等于 QQ 服务端的完整删除备份。
-
-## 截图
-
-| 仪表盘 | 归档内容 |
-|--------|----------|
-| ![仪表盘](public/runtime/仪表盘.png) | ![归档内容](public/runtime/归档内容.png) |
-
-| 媒体时光轴 | 归档任务 |
-|-----------|----------|
-| ![媒体时光轴](public/runtime/媒体时光轴.png) | ![归档任务](public/runtime/归档任务.png) |
+macOS 包采用临时签名，首次打开若被 Gatekeeper 拦截，请在“系统设置 → 隐私与安全性”中确认打开。iOS 包未签名，不能直接安装或提交 App Store。
 
 ## 技术栈
 
@@ -103,7 +73,7 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 | 状态管理 | Pinia |
 | 后端数据库 | SQLite (rusqlite) |
 | HTTP 客户端 | reqwest (rustls-tls) |
-| 打包 | NSIS (Windows) / Android APK |
+| 打包 | NSIS / DMG / AppImage / deb / rpm / APK / unsigned IPA / Nix closure |
 
 ## 开发
 
@@ -166,18 +136,22 @@ npm run tauri android build
 
 ## 原理
 
-### 数据来源
+### 数据来源与完整度
 
-归档基于 QQ 空间的**移动端互动列表接口** (`mobile.qzone.qq.com/get_feeds`)。该接口返回当前账号收到的所有互动通知——包括好友发布的新动态、点赞、评论、回复、留言等。程序从中提取原始动态内容并存入本地数据库。
+归档会合并三类来源：QQ 空间当前可见说说接口、旧历史消息接口，以及移动端互动列表接口 (`mobile.qzone.qq.com/get_feeds`)。可见说说会使用接口返回的 `total` 逐页对账；历史残留采用顺序扫描并验证最后一次命中后的 6,000 个记录位置；其他动态与留言主要来自互动通知和旧历史卡片。多来源记录按说说 ID、用户 QQ 号和事件时间合并，搜索在整个 SQLite 归档中执行，不受当前分页限制。
 
-**没有被点赞或评论过的动态无法被恢复**，因为它们不会出现在互动列表中。
+旧历史卡片显示的是点赞或评论发生时间，不是说说发布时间。对于仍保留标准 QQ 说说 ID 的记录，程序会从 ID 中校验账号并解码原始发布时间；无法验证的记录才保留接口时间。本地现有样本已经验证到 2018 年，但是否存在 2017 年记录必须以该账号在本次深度扫描中实际返回的数据为准。
+
+图片和视频会保留接口返回的多个清晰度候选地址，并过滤头像、点赞图标和空间装饰图。部分旧资源的原图或视频签名已经被 QQ 服务端清理或过期时，只能保存仍可访问的低清地址或封面。
+
+界面中的最早年份只代表本次请求在已验证范围内最早命中的记录，不能据此断言账号在更早年份没有发布内容。**没有被点赞或评论过、已被服务端彻底清除、超出接口保留范围或接口当前拒绝返回的动态无法恢复**。其他动态与留言也没有权威的服务端总数，因此只能报告本次接口返回量，不能保证穷尽。
 
 ### 登录方式
 
 - **二维码登录**：调用 QQ 空间移动端扫码登录流程，全程不接触密码
 - **网页登录**（桌面端）：打开独立窗口加载 QQ 登录页，通过 WebView Cookie API 提取登录凭证
 
-登录凭证（Cookie）仅存储在 Rust 后端内存中，不会写入控制台或日志。
+登录凭证（Cookie）不会写入 SQLite、浏览器本地存储或日志。桌面端在用户登录成功后将必要会话加密保存到操作系统安全凭据库，用于下次启动恢复登录；退出登录或“删除所有数据”会清除该凭据。QQ 会话自身过期后仍需重新登录。
 
 ## 注意事项
 

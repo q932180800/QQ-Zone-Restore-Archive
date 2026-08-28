@@ -27,7 +27,7 @@ export interface ArchiveItem {
   likes: LikeUser[];
   comments: ArchiveComment[];
 }
-export interface LikeUser { uin?: string; nickname?: string; }
+export interface LikeUser { uin?: string; nickname?: string; historical: boolean; likedAt: number; }
 export interface ArchiveReply { uin?: string; nickname?: string; replyToUin?: string; replyToNickname?: string; content: string; createdAt: number; }
 export interface ArchiveComment { uin?: string; nickname?: string; content: string; createdAt: number; replies: ArchiveReply[]; }
 export type ArchiveCategory = "self" | "other" | "guestbook";
@@ -38,11 +38,11 @@ export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_pro
 export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
 export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
 export const retryArchiveSkip = (id: number) => invoke<ArchiveSkipRetryResult>("retry_archive_skip", { id });
-export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self", year?: number, descending = true) => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category, year, descending });
+export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self", year?: number, descending = true, query?: string) => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category, year, descending, query });
 export const listArchiveYears = (category: ArchiveCategory = "self") => invoke<number[]>("list_archive_years", { category });
 export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invoke<ArchiveMediaPage>("list_archived_media", { limit, offset, year });
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
-export const countArchivedFeeds = (category: ArchiveCategory = "self", year?: number) => invoke<number>("count_archived_feeds", { category, year });
+export const countArchivedFeeds = (category: ArchiveCategory = "self", year?: number, query?: string) => invoke<number>("count_archived_feeds", { category, year, query });
 export const exportArchivedHtml = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_html", { category, ids });
 export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<string>("load_archived_image", { id, pictureIndex });
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
@@ -58,6 +58,7 @@ export const clearArchivedFeeds = () => invoke<number>("clear_archived_feeds");
 export const deleteAllAppData = () => invoke<void>("delete_all_app_data");
 
 export const openRecyclePasswordWindow = () => invoke<void>("open_recycle_password_window");
+export const prepareRecyclePasswordWindow = () => invoke<string>("prepare_recycle_password_window");
 export const checkRecyclePassword = () => invoke<string | null>("check_recycle_password");
 export const closeRecyclePasswordWindow = () => invoke<void>("close_recycle_password_window");
 export const listRecycleAlbums = (pwd2sig: string) => invoke<Record<string, unknown>>("list_recycle_albums", { pwd2sig });
@@ -68,3 +69,21 @@ export const recoverRecycleAlbum = (pwd2sig: string, albumId: string) => invoke<
 export const recoverRecyclePhotos = (pwd2sig: string, sourceAlbumId: string, targetAlbumId: string, photoIds: string[]) =>
   invoke<Record<string, unknown>>("recover_recycle_photos", { pwd2sig, sourceAlbumId, targetAlbumId, photoIds });
 export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("load_recycle_photo_preview", { imageUrl });
+
+export type LibraryModule = "albums" | "photos" | "videos" | "guestbook" | "favorites";
+export interface LibraryItem {
+  id: number; module: LibraryModule; itemKey: string; parentKey: string; createdAt: number;
+  title: string; summary: string; authorUin?: string; authorName?: string; coverUrl?: string; mediaUrls: string[];
+}
+export interface LibraryPage {
+  items: LibraryItem[]; total: number; remoteTotal: number; complete: boolean; syncedAt: number; lastError?: string;
+}
+export interface LibrarySyncResult {
+  module: LibraryModule; fetched: number; saved: number; remoteTotal: number; complete: boolean; message: string;
+}
+export const syncQzoneLibrary = (module: LibraryModule, parentKey?: string) =>
+  invoke<LibrarySyncResult>("sync_qzone_library", { module, parentKey });
+export const listQzoneLibrary = (module: LibraryModule, parentKey?: string, query?: string, year?: number, limit = 60, offset = 0) =>
+  invoke<LibraryPage>("list_qzone_library", { module, parentKey, query, year, limit, offset });
+export const listQzoneLibraryYears = (module: LibraryModule, parentKey?: string) =>
+  invoke<number[]>("list_qzone_library_years", { module, parentKey });
